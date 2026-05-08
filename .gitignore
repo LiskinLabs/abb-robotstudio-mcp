@@ -1,0 +1,16 @@
+node_modules/
+dist/
+*.log
+.env
+.env.local
+
+# C# / Add-In build artifacts
+addin/bin/
+addin/obj/
+*.user
+*.suo
+.vs/
+
+# OS
+.DS_Store
+Thumbs.db
