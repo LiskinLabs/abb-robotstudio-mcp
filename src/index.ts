@@ -2,8 +2,10 @@
 
 /**
  * ABB RobotStudio MCP Server — Combined SDK + RWS
- * - SDK tools (rs_*): Control RobotStudio app via ClaudeBridge Add-In
+ * - SDK tools (rs_*): Control RobotStudio app via ClaudeBridge Add-In (TcpListener)
  * - RWS tools (rws_*): Control the robot controller via Robot Web Services
+ *
+ * v2.1.0 — TcpListener bridge with AbortController timeouts, new tools
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -22,16 +24,37 @@ const RWS_PASS = process.env.ABB_RWS_PASS || "robotics";
 async function bridge(
   path: string,
   method: "GET" | "POST" = "GET",
-  body?: object
+  body?: object,
+  timeoutMs: number = 15000
 ): Promise<any> {
-  const res = await fetch(`${BRIDGE_URL}${path}`, {
-    method,
-    headers: body ? { "Content-Type": "application/json" } : {},
-    body: body ? JSON.stringify(body) : null,
-  });
-  const json = (await res.json()) as Record<string, unknown>;
-  if (json.error) throw new Error(String(json.error));
-  return json;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch(`${BRIDGE_URL}${path}`, {
+      method,
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : null,
+      signal: controller.signal,
+    });
+    const json = (await res.json()) as Record<string, unknown>;
+    if (json.error) throw new Error(String(json.error));
+    return json;
+  } catch (e: any) {
+    if (e.name === "AbortError") {
+      throw new Error(
+        `Request to ClaudeBridge timed out after ${timeoutMs}ms. The RobotStudio UI thread may be busy.`
+      );
+    }
+    if (e.cause?.code === "ECONNREFUSED") {
+      throw new Error(
+        `Cannot connect to ClaudeBridge at ${BRIDGE_URL}. Is RobotStudio running with the Add-In loaded?`
+      );
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // ── RWS Client (Robot Web Services REST) ────────────────────
@@ -46,7 +69,6 @@ async function rws(
   bodyOrCt?: string,
   ct?: string
 ): Promise<{ status: number; body: string }> {
-  // Support both rws("/path") and rws("POST", "/path", body, ct)
   let method: string, path: string, body: string | undefined, contentType: string | undefined;
   if (methodOrPath === "GET" || methodOrPath === "POST" || methodOrPath === "PUT") {
     method = methodOrPath; path = pathOrBody!; body = bodyOrCt; contentType = ct;
@@ -95,15 +117,21 @@ function rwsExtractAll(xml: string, field: string): string[] {
 function ok(data: any) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
-function err(e: any) {
-  return { content: [{ type: "text" as const, text: `Error: ${e.message ?? e}` }] };
+
+function err(e: any, context?: string) {
+  const message = e?.message ?? String(e ?? "Unknown error");
+  const prefix = context ? `[${context}] ` : "";
+  return {
+    content: [{ type: "text" as const, text: JSON.stringify({ error: prefix + message }, null, 2) }],
+    isError: true,
+  };
 }
 
 // ── MCP Server ───────────────────────────────────────────────
 
 const server = new McpServer({
   name: "abb-robotstudio",
-  version: "2.0.0",
+  version: "2.1.0",
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -111,8 +139,10 @@ const server = new McpServer({
 // ═══════════════════════════════════════════════════════════════
 
 server.tool("rs_ping", "Check if RobotStudio ClaudeBridge Add-In is running and connected", {},
-  async () => { try { return ok(await bridge("/ping")); } catch (e: any) {
-    return err(`Cannot connect to ClaudeBridge at ${BRIDGE_URL}. Is RobotStudio running?`);
+  async () => { try {
+    return ok(await bridge("/ping", "GET", undefined, 5000));
+  } catch (e: any) {
+    return err(new Error(`Cannot connect to ClaudeBridge at ${BRIDGE_URL}. Is RobotStudio running?`));
   }}
 );
 
@@ -122,8 +152,12 @@ server.tool("rs_get_station", "Get active RobotStudio station info (name, contro
   async () => { try { return ok(await bridge("/station")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_get_station_objects", "List all objects in the station (robots, tools, smart components)", {},
-  async () => { try { return ok(await bridge("/station/objects")); } catch (e: any) { return err(e); } }
+server.tool("rs_get_station_objects", "List all objects in the station (robots, tools, smart components). Set bbox=true for bounding box and position data.",
+  { bbox: z.boolean().optional().describe("Include bounding box and position (default: false)") },
+  async ({ bbox }) => { try {
+    const path = bbox ? "/station/objects?bbox=true" : "/station/objects";
+    return ok(await bridge(path));
+  } catch (e: any) { return err(e); } }
 );
 
 server.tool("rs_save_station", "Save the active station to disk", {},
@@ -146,14 +180,15 @@ server.tool("rs_get_modules", "List RAPID modules in a task (SDK)",
 server.tool("rs_read_module", "Read full RAPID source code of a module (SDK)",
   { task: z.string(), module: z.string().describe("e.g. 'module_MAIN', 'module_EGM', 'Wizard_Params'") },
   async ({ task, module }) => { try {
-    return ok(await bridge(`/rapid/module/text?task=${encodeURIComponent(task)}&module=${encodeURIComponent(module)}`));
+    return ok(await bridge(`/rapid/module/text?task=${encodeURIComponent(task)}&module=${encodeURIComponent(module)}`, "GET", undefined, 30000));
   } catch (e: any) { return err(e); } }
 );
 
 server.tool("rs_write_module", "Write RAPID module source code into running controller (SDK)",
-  { task: z.string(), module: z.string(), code: z.string().describe("Full RAPID code (MODULE ... ENDMODULE)") },
-  async ({ task, module, code }) => { try {
-    return ok(await bridge(`/rapid/module/text?task=${encodeURIComponent(task)}&module=${encodeURIComponent(module)}`, "POST", { code }));
+  { task: z.string(), module: z.string(), code: z.string().describe("Full RAPID code (MODULE ... ENDMODULE)"),
+    replace: z.boolean().optional().describe("Replace existing modules (default: true)") },
+  async ({ task, module, code, replace }) => { try {
+    return ok(await bridge(`/rapid/module/text?task=${encodeURIComponent(task)}&module=${encodeURIComponent(module)}`, "POST", { code, replace }, 30000));
   } catch (e: any) { return err(e); } }
 );
 
@@ -168,6 +203,44 @@ server.tool("rs_write_variable", "Set a RAPID variable initial value (SDK)",
   { task: z.string(), name: z.string(), value: z.string() },
   async ({ task, name, value }) => { try {
     return ok(await bridge(`/rapid/variable?task=${encodeURIComponent(task)}&name=${encodeURIComponent(name)}`, "POST", { value }));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_list_variables", "List RAPID variables with optional type/module filter (SDK)",
+  { task: z.string().optional().describe("Task name (default: T_ROB1)"),
+    typeFilter: z.string().optional().describe("Filter by data type e.g. 'robtarget', 'tooldata', 'wobjdata', 'num'"),
+    module: z.string().optional().describe("Filter by module name") },
+  async ({ task, typeFilter, module }) => { try {
+    let p = `/rapid/variables?task=${encodeURIComponent(task || "T_ROB1")}`;
+    if (typeFilter) p += `&typeFilter=${encodeURIComponent(typeFilter)}`;
+    if (module) p += `&module=${encodeURIComponent(module)}`;
+    return ok(await bridge(p));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_get_execution_errors", "Read controller event log for errors and warnings (SDK)",
+  { count: z.number().optional().describe("Max messages to return (default: 10, max: 100)") },
+  async ({ count }) => { try {
+    return ok(await bridge(`/rapid/errors?count=${count || 10}`));
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rs_get_screenshot", "Capture 3D view screenshot as base64 PNG (SDK)",
+  { width: z.number().optional().describe("Width in pixels (default: 1280, max: 3840)"),
+    height: z.number().optional().describe("Height in pixels (default: 720, max: 2160)") },
+  async ({ width, height }) => { try {
+    const result = await bridge("/screenshot", "POST", {
+      width: width || 1280,
+      height: height || 720,
+    }, 20000);
+    return {
+      content: [
+        { type: "image" as const, data: result.imageBase64, mimeType: result.mimeType || "image/png" },
+        { type: "text" as const, text: JSON.stringify({
+          width: result.width, height: result.height, timestamp: result.timestamp
+        }, null, 2) },
+      ],
+    };
   } catch (e: any) { return err(e); } }
 );
 
@@ -189,7 +262,7 @@ server.tool("rs_pause_simulation", "Pause RobotStudio simulation", {},
   async () => { try { return ok(await bridge("/simulation/pause", "POST")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_reset_simulation", "Reset simulation to start position", {},
+server.tool("rs_reset_simulation", "Reset simulation to start position (stops simulation and resets PP)", {},
   async () => { try { return ok(await bridge("/simulation/reset", "POST")); } catch (e: any) { return err(e); } }
 );
 
@@ -464,7 +537,14 @@ server.tool("rws_event_log", "Get controller event log via RWS",
   { count: z.number().optional().describe("Default: 10") },
   async ({ count }) => { try {
     const r = await rws( `/rw/elog/0?lang=en&count=${count || 10}`);
-    return ok({ log: r.body });
+    const titles = rwsExtractAll(r.body, "title");
+    const bodies = rwsExtractAll(r.body, "body");
+    const timestamps = rwsExtractAll(r.body, "timestamp");
+    const types = rwsExtractAll(r.body, "msgtype");
+    const entries = titles.map((t, i) => ({
+      title: t, body: bodies[i] ?? "", timestamp: timestamps[i] ?? "", type: types[i] ?? ""
+    }));
+    return ok(entries.length > 0 ? entries : { raw: r.body });
   } catch (e: any) { return err(e); } }
 );
 
@@ -517,9 +597,10 @@ server.tool("rws_release_mastership", "Release mastership",
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("ABB RobotStudio MCP Server v2.0 (SDK + RWS combined)");
-  console.error(`  SDK Bridge: ${BRIDGE_URL}`);
-  console.error(`  RWS:        ${RWS_URL}`);
+  console.error("ABB RobotStudio MCP Server v2.1.0 (SDK + RWS combined)");
+  console.error("  SDK Bridge: " + BRIDGE_URL + " (TcpListener, no admin rights)");
+  console.error("  RWS:        " + RWS_URL);
+  console.error("  Tools:      " + "rs_* (31) + rws_* (24) = 55 total");
 }
 
 main().catch((err) => {

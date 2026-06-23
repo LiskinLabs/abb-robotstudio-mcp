@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<RobotStudioAddIn xmlns="urn:abb-robotics-robotstudio-addin"
+                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+                  xsi:schemaLocation="urn:abb-robotics-robotstudio-addin RobotStudioAddIn.xsd">
+  <Assembly>
+    <FileName>ClaudeBridge.dll</FileName>
+  </Assembly>
+  <AddInType>General</AddInType>
+  <Dependencies>Online</Dependencies>
+  <Platform>Any</Platform>
+  <EntryMethod>ClaudeBridge.ClaudeBridgeAddIn.AddinMain</EntryMethod>
+  <AutoLoad>true</AutoLoad>
+</RobotStudioAddIn>

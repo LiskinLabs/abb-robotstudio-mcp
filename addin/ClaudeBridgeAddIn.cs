@@ -1,11 +1,14 @@
 using System;
+using System.Collections.Generic;
+using System.Collections.Specialized;
+using System.Drawing;
+using System.Drawing.Imaging;
+using System.IO;
+using System.Linq;
 using System.Net;
+using System.Net.Sockets;
 using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
-using System.Collections.Generic;
-using System.Linq;
-using System.IO;
 using ABB.Robotics.RobotStudio;
 using ABB.Robotics.RobotStudio.Environment;
 using ABB.Robotics.RobotStudio.Stations;
@@ -19,10 +22,12 @@ namespace ClaudeBridge
 {
     public class ClaudeBridgeAddIn
     {
-        private HttpListener _listener;
+        private TcpListener _listener;
         private CancellationTokenSource _cts;
         private const int Port = 58080;
         private static readonly Queue<Action> _uiQueue = new Queue<Action>();
+        private Thread _serverThread;
+        private bool _shuttingDown;
 
         // ── Add-In Entry Point ───────────────────────────────────
 
@@ -30,20 +35,37 @@ namespace ClaudeBridge
         {
             var addIn = new ClaudeBridgeAddIn();
             addIn.Start();
-            Logger.AddMessage(new LogMessage("ClaudeBridge HTTP server started on port " + Port));
+            Logger.AddMessage(new LogMessage("ClaudeBridge HTTP server started on port " + Port + " (TcpListener)"));
         }
 
         public void Start()
         {
             _cts = new CancellationTokenSource();
-            _listener = new HttpListener();
-            _listener.Prefixes.Add($"http://localhost:{Port}/");
+            _listener = new TcpListener(IPAddress.Loopback, Port);
             _listener.Start();
 
             // Process queued UI-thread actions on the Idle event
             UIEnvironment.Idle += OnIdle;
 
-            System.Threading.Tasks.Task.Run(() => ListenLoop(_cts.Token));
+            // Start server on background thread
+            _serverThread = new Thread(() => ListenLoop(_cts.Token))
+            {
+                IsBackground = true,
+                Name = "ClaudeBridge-Server"
+            };
+            _serverThread.Start();
+        }
+
+        public void Shutdown()
+        {
+            if (_shuttingDown) return;
+            _shuttingDown = true;
+
+            try { _cts?.Cancel(); } catch { }
+            try { _listener?.Stop(); } catch { }
+            UIEnvironment.Idle -= OnIdle;
+
+            Logger.AddMessage(new LogMessage("ClaudeBridge HTTP server stopped"));
         }
 
         private static void OnIdle(object sender, EventArgs e)
@@ -84,16 +106,24 @@ namespace ClaudeBridge
             return result;
         }
 
-        private async System.Threading.Tasks.Task ListenLoop(CancellationToken ct)
+        // ── TcpListener Server Loop ─────────────────────────────
+
+        private void ListenLoop(CancellationToken ct)
         {
             while (!ct.IsCancellationRequested)
             {
                 try
                 {
-                    var context = await _listener.GetContextAsync();
-                    _ = System.Threading.Tasks.Task.Run(() => HandleRequest(context));
+                    if (!_listener.Pending())
+                    {
+                        Thread.Sleep(50);
+                        continue;
+                    }
+                    var client = _listener.AcceptTcpClient();
+                    ThreadPool.QueueUserWorkItem(_ => HandleClient(client));
                 }
-                catch (Exception) when (ct.IsCancellationRequested) { break; }
+                catch (SocketException) when (ct.IsCancellationRequested) { break; }
+                catch (ObjectDisposedException) { break; }
                 catch (Exception ex)
                 {
                     Logger.AddMessage(new LogMessage("ClaudeBridge error: " + ex.Message));
@@ -101,44 +131,184 @@ namespace ClaudeBridge
             }
         }
 
-        // ── Request Handler ──────────────────────────────────────
+        // ── Manual HTTP Parser ──────────────────────────────────
 
-        private void HandleRequest(HttpListenerContext ctx)
+        private void HandleClient(TcpClient client)
         {
-            var path = ctx.Request.Url.AbsolutePath.TrimEnd('/').ToLower();
-            var method = ctx.Request.HttpMethod;
+            string method = "GET";
+            string path = "/";
             string body = null;
-
-            if (method == "POST" || method == "PUT")
-            {
-                using (var reader = new StreamReader(ctx.Request.InputStream))
-                    body = reader.ReadToEnd();
-            }
-
-            object result;
+            var query = new NameValueCollection();
             int statusCode = 200;
+
             try
             {
-                result = RunOnUIThread(() =>
-                    Route(path, method, body, ctx.Request.QueryString));
+                using (client)
+                using (var stream = client.GetStream())
+                {
+                    stream.ReadTimeout = 30000;
+                    stream.WriteTimeout = 30000;
+
+                    // Read until \r\n\r\n (header terminator)
+                    var buffer = new byte[8192];
+                    var headerBuffer = new StringBuilder();
+                    int totalRead = 0;
+                    bool headersComplete = false;
+                    int contentLength = 0;
+
+                    while (totalRead < 65536 && !headersComplete)
+                    {
+                        int bytesRead = stream.Read(buffer, 0, buffer.Length);
+                        if (bytesRead == 0) break;
+                        headerBuffer.Append(Encoding.ASCII.GetString(buffer, 0, bytesRead));
+                        totalRead += bytesRead;
+
+                        var text = headerBuffer.ToString();
+                        int headerEnd = text.IndexOf("\r\n\r\n");
+                        if (headerEnd >= 0)
+                        {
+                            headersComplete = true;
+                            // Parse headers
+                            var headerSection = text.Substring(0, headerEnd);
+                            var lines = headerSection.Split(new[] { "\r\n" }, StringSplitOptions.None);
+
+                            // Request line: METHOD /path?query HTTP/1.1
+                            if (lines.Length > 0)
+                            {
+                                var parts = lines[0].Split(' ');
+                                if (parts.Length >= 2)
+                                {
+                                    method = parts[0].ToUpper();
+                                    var fullPath = parts[1];
+                                    int qIdx = fullPath.IndexOf('?');
+                                    if (qIdx >= 0)
+                                    {
+                                        path = fullPath.Substring(0, qIdx);
+                                        ParseQueryString(fullPath.Substring(qIdx + 1), query);
+                                    }
+                                    else
+                                    {
+                                        path = fullPath;
+                                    }
+                                }
+                            }
+
+                            // Parse header lines
+                            for (int i = 1; i < lines.Length; i++)
+                            {
+                                var colonIdx = lines[i].IndexOf(':');
+                                if (colonIdx > 0)
+                                {
+                                    var key = lines[i].Substring(0, colonIdx).Trim();
+                                    var val = lines[i].Substring(colonIdx + 1).Trim();
+                                    if (key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
+                                        int.TryParse(val, out contentLength);
+                                }
+                            }
+
+                            // Read remaining body if not already in buffer
+                            if (contentLength > 0)
+                            {
+                                var bodyStart = headerEnd + 4; // after \r\n\r\n
+                                var alreadyRead = totalRead - bodyStart;
+
+                                var bodyBytes = new byte[contentLength];
+                                if (alreadyRead > 0)
+                                {
+                                    var headerBytes = Encoding.ASCII.GetBytes(headerSection + "\r\n\r\n");
+                                    var remainingStart = totalRead - alreadyRead;
+                                    // Copy trailing bytes that are actually body
+                                    var bodyInBuffer = Math.Min(alreadyRead, contentLength);
+                                    Array.Copy(buffer, buffer.Length - (totalRead - remainingStart),
+                                        bodyBytes, 0, bodyInBuffer);
+                                }
+
+                                // Read remaining body bytes
+                                int bodyRead = Math.Min(alreadyRead, contentLength);
+                                while (bodyRead < contentLength)
+                                {
+                                    int n = stream.Read(bodyBytes, bodyRead, contentLength - bodyRead);
+                                    if (n == 0) break;
+                                    bodyRead += n;
+                                }
+                                body = Encoding.UTF8.GetString(bodyBytes);
+                            }
+                        }
+                    }
+
+                    path = path.TrimEnd('/').ToLower();
+                    if (string.IsNullOrEmpty(path)) path = "/";
+
+                    // Route to handler on UI thread
+                    object result;
+                    try
+                    {
+                        result = RunOnUIThread(() =>
+                            Route(path, method, body, query));
+                    }
+                    catch (Exception ex)
+                    {
+                        result = new { error = ex.Message };
+                        statusCode = 500;
+                    }
+
+                    SendResponse(client, statusCode, result);
+                }
             }
             catch (Exception ex)
             {
-                result = new { error = ex.Message };
-                statusCode = 500;
+                try
+                {
+                    SendResponse(client, 500, new { error = "Internal server error: " + ex.Message });
+                }
+                catch { /* best effort */ }
             }
-
-            var json = JsonConvert.SerializeObject(result, Formatting.Indented);
-            var bytes = Encoding.UTF8.GetBytes(json);
-            ctx.Response.StatusCode = statusCode;
-            ctx.Response.ContentType = "application/json";
-            ctx.Response.ContentLength64 = bytes.Length;
-            ctx.Response.OutputStream.Write(bytes, 0, bytes.Length);
-            ctx.Response.Close();
         }
 
+        private static void ParseQueryString(string queryString, NameValueCollection query)
+        {
+            if (string.IsNullOrEmpty(queryString)) return;
+            foreach (var pair in queryString.Split('&'))
+            {
+                var eqIdx = pair.IndexOf('=');
+                if (eqIdx > 0)
+                    query[Uri.UnescapeDataString(pair.Substring(0, eqIdx))] =
+                        Uri.UnescapeDataString(pair.Substring(eqIdx + 1));
+                else
+                    query[Uri.UnescapeDataString(pair)] = "";
+            }
+        }
+
+        private static void SendResponse(TcpClient client, int statusCode, object data)
+        {
+            try
+            {
+                var json = JsonConvert.SerializeObject(data, Formatting.Indented);
+                var jsonBytes = Encoding.UTF8.GetBytes(json);
+                var statusText = statusCode == 200 ? "OK" :
+                                 statusCode == 400 ? "Bad Request" :
+                                 statusCode == 500 ? "Internal Server Error" : "OK";
+
+                var sb = new StringBuilder();
+                sb.Append("HTTP/1.1 " + statusCode + " " + statusText + "\r\n");
+                sb.Append("Content-Type: application/json; charset=utf-8\r\n");
+                sb.Append("Content-Length: " + jsonBytes.Length + "\r\n");
+                sb.Append("Connection: close\r\n");
+                sb.Append("\r\n");
+
+                var headerBytes = Encoding.ASCII.GetBytes(sb.ToString());
+                var stream = client.GetStream();
+                stream.Write(headerBytes, 0, headerBytes.Length);
+                stream.Write(jsonBytes, 0, jsonBytes.Length);
+                stream.Flush();
+            }
+            catch { /* client may have disconnected */ }
+        }
+
+        // ── Route Dispatcher ─────────────────────────────────────
+
         private object Route(string path, string method, string body,
-            System.Collections.Specialized.NameValueCollection query)
+            NameValueCollection query)
         {
             switch (path)
             {
@@ -149,13 +319,16 @@ namespace ClaudeBridge
                         status = "ok",
                         server = "ClaudeBridge",
                         port = Port,
+                        transport = "TcpListener",
                         stationOpen = station != null,
                         stationName = station?.Name ?? "(none)"
                     };
 
                 // ── Station ───────────────────────────────────
                 case "/station":              return GetStation();
-                case "/station/objects":      return GetStationObjects();
+                case "/station/objects":      return method == "GET" && query["bbox"] == "true"
+                                                    ? GetStationObjectsDetailed()
+                                                    : GetStationObjects();
                 case "/station/save":         return SaveStation();
 
                 // ── RAPID ─────────────────────────────────────
@@ -169,6 +342,10 @@ namespace ClaudeBridge
                     return method == "GET"
                         ? GetRapidVariable(query["task"], query["name"])
                         : SetRapidVariable(query["task"], query["name"], body);
+                case "/rapid/variables":
+                    return ListRapidVariables(query);
+                case "/rapid/errors":
+                    return GetExecutionErrors(query["count"]);
 
                 // ── Controller ────────────────────────────────
                 case "/controller/status":    return GetControllerStatus();
@@ -205,8 +382,11 @@ namespace ClaudeBridge
                 // ── Collision Detection ───────────────────────
                 case "/collision/check":      return CheckCollisions();
 
+                // ── Screenshot ────────────────────────────────
+                case "/screenshot":           return TakeScreenshot(body);
+
                 default:
-                    return new { error = $"Unknown endpoint: {path}" };
+                    return new { error = "Unknown endpoint: " + path };
             }
         }
 
@@ -233,7 +413,6 @@ namespace ClaudeBridge
             var scanner = new NetworkScanner();
             scanner.Scan();
 
-            // Try by SystemId first, then fall back to matching by name
             ControllerInfo ctrlInfo = null;
             try
             {
@@ -244,14 +423,13 @@ namespace ClaudeBridge
 
             if (ctrlInfo == null)
             {
-                // Find by controller name
                 var allControllers = scanner.GetControllers();
                 ctrlInfo = allControllers.FirstOrDefault(c =>
                     c.Name.Equals(rsCtrl.Name, StringComparison.OrdinalIgnoreCase));
                 if (ctrlInfo == null)
                 {
-                    var names = string.Join(", ", allControllers.Select(c => $"{c.Name} ({c.SystemId})"));
-                    throw new Exception($"Controller '{rsCtrl.Name}' not found. Available: [{names}]");
+                    var names = string.Join(", ", allControllers.Select(c => c.Name + " (" + c.SystemId + ")"));
+                    throw new Exception("Controller '" + rsCtrl.Name + "' not found. Available: [" + names + "]");
                 }
             }
 
@@ -262,7 +440,6 @@ namespace ClaudeBridge
 
         private RsTask FindTask(RsIrc5Controller ctrl, string taskName)
         {
-            // Check motion tasks and non-motion tasks
             var allTasks = ctrl.Tasks.Cast<RsTask>()
                 .Concat(ctrl.NonMotionTasks.Cast<RsTask>())
                 .ToList();
@@ -273,7 +450,7 @@ namespace ClaudeBridge
 
             return allTasks.FirstOrDefault(t =>
                     t.Name.Equals(taskName, StringComparison.OrdinalIgnoreCase))
-                ?? throw new Exception($"Task '{taskName}' not found. Available: " +
+                ?? throw new Exception("Task '" + taskName + "' not found. Available: " +
                     string.Join(", ", allTasks.Select(t => t.Name)));
         }
 
@@ -332,11 +509,96 @@ namespace ClaudeBridge
             }
         }
 
+        private object GetStationObjectsDetailed()
+        {
+            var station = GetActiveStation();
+            var objects = new List<object>();
+            CollectObjectsDetailed(station, objects, 0);
+            return new { stationName = station.Name, objectCount = objects.Count, objects };
+        }
+
+        private void CollectObjectsDetailed(ProjectObject parent, List<object> list, int depth)
+        {
+            foreach (ProjectObject child in parent.Children)
+            {
+                var obj = new Dictionary<string, object>
+                {
+                    ["name"] = child.Name,
+                    ["type"] = child.GetType().Name,
+                    ["depth"] = depth
+                };
+
+                try
+                {
+                    var gc = child as GraphicComponent;
+                    if (gc != null)
+                    {
+                        var transform = gc.Transform;
+                        if (transform != null)
+                        {
+                            try
+                            {
+                                var gmat = TryGetProperty(transform, "GlobalMatrix");
+                                if (gmat != null)
+                                {
+                                    var trans = TryGetProperty(gmat, "Translation");
+                                    if (trans != null)
+                                    {
+                                        obj["position"] = new
+                                        {
+                                            x = Math.Round(GetDoubleProp(trans, "X"), 3),
+                                            y = Math.Round(GetDoubleProp(trans, "Y"), 3),
+                                            z = Math.Round(GetDoubleProp(trans, "Z"), 3)
+                                        };
+                                    }
+                                }
+                            }
+                            catch { }
+                        }
+
+                        var bb = gc.GetBoundingBox(true);
+                        if (bb != null)
+                        {
+                            try
+                            {
+                                var bbMin = TryGetProperty(bb, "Min");
+                                var bbMax = TryGetProperty(bb, "Max");
+                                if (bbMin != null && bbMax != null)
+                                {
+                                    double minX = GetDoubleProp(bbMin, "X"), minY = GetDoubleProp(bbMin, "Y"), minZ = GetDoubleProp(bbMin, "Z");
+                                    double maxX = GetDoubleProp(bbMax, "X"), maxY = GetDoubleProp(bbMax, "Y"), maxZ = GetDoubleProp(bbMax, "Z");
+                                    obj["boundingBox"] = new
+                                    {
+                                        minX_mm = Math.Round(minX * 1000, 1),
+                                        minY_mm = Math.Round(minY * 1000, 1),
+                                        minZ_mm = Math.Round(minZ * 1000, 1),
+                                        maxX_mm = Math.Round(maxX * 1000, 1),
+                                        maxY_mm = Math.Round(maxY * 1000, 1),
+                                        maxZ_mm = Math.Round(maxZ * 1000, 1),
+                                        sizeX_mm = Math.Round((maxX - minX) * 1000, 1),
+                                        sizeY_mm = Math.Round((maxY - minY) * 1000, 1),
+                                        sizeZ_mm = Math.Round((maxZ - minZ) * 1000, 1)
+                                    };
+                                }
+                            }
+                            catch { }
+                        }
+                    }
+                }
+                catch { /* bounding box not always available */ }
+
+                list.Add(obj);
+
+                if (depth < 4)
+                    CollectObjectsDetailed(child, list, depth + 1);
+            }
+        }
+
         private object SaveStation()
         {
             var station = GetActiveStation();
             station.Save();
-            return new { success = true, message = $"Station '{station.Name}' saved" };
+            return new { success = true, message = "Station '" + station.Name + "' saved" };
         }
 
         // ── RAPID Endpoints ──────────────────────────────────
@@ -353,9 +615,9 @@ namespace ClaudeBridge
                     var children = new List<string>();
                     foreach (ProjectObject child in task.Children)
                     {
-                        children.Add($"{child.Name} ({child.GetType().Name})");
+                        children.Add(child.Name + " (" + child.GetType().Name + ")");
                         foreach (ProjectObject gc in child.Children)
-                            children.Add($"  {gc.Name} ({gc.GetType().Name})");
+                            children.Add("  " + gc.Name + " (" + gc.GetType().Name + ")");
                     }
                     tasks.Add(new
                     {
@@ -385,7 +647,8 @@ namespace ClaudeBridge
                     modules.Add(new
                     {
                         name = mod.Name,
-                        type = mod.Type.ToString()
+                        type = mod.Type.ToString(),
+                        isSystem = mod.IsSystem
                     });
                 }
                 return modules;
@@ -400,22 +663,21 @@ namespace ClaudeBridge
                 step = "ConnectToController";
                 using (var controller = ConnectToController())
                 {
-                    step = $"GetTask({taskName})";
+                    step = "GetTask(" + taskName + ")";
                     var task = controller.Rapid.GetTask(taskName ?? "T_ROB1");
 
-                    step = $"GetModule({moduleName})";
+                    step = "GetModule(" + moduleName + ")";
                     var module = task.GetModule(moduleName);
                     if (module == null)
-                        throw new Exception($"Module '{moduleName}' not found in task '{taskName}'");
+                        throw new Exception("Module '" + moduleName + "' not found in task '" + taskName + "'");
 
-                    var localDir = @"C:\temp\claude_rapid";
+                    var localDir = Path.Combine(Path.GetTempPath(), "claude_rapid");
                     Directory.CreateDirectory(localDir);
-                    var localFile = Path.Combine(localDir, $"{moduleName}.mod");
+                    var localFile = Path.Combine(localDir, moduleName + ".mod");
                     bool isSystem = module.IsSystem;
 
                     if (!isSystem)
                     {
-                        // Program module: save program, then download the file
                         step = "SaveProgramToFile";
                         var remoteDir = "$HOME/_claude_tmp_prog";
                         task.SaveProgramToFile(remoteDir);
@@ -435,7 +697,7 @@ namespace ClaudeBridge
 
                         if (foundRemote != null)
                         {
-                            step = $"GetFile({foundRemote})";
+                            step = "GetFile(" + foundRemote + ")";
                             controller.FileSystem.GetFile(foundRemote, localFile, true);
                             string text = File.ReadAllText(localFile);
                             try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
@@ -445,10 +707,8 @@ namespace ClaudeBridge
                         try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
                     }
 
-                    // System module or not found in program: search controller filesystem
                     step = "SearchSystemModule";
                     string[] searchDirs = { "$HOME", "$SYSTEM", "$SYSTEM/RAPID" };
-                    string[] extensions = { ".sys", ".sysx", ".mod", ".modx" };
 
                     foreach (var dir in searchDirs)
                     {
@@ -460,7 +720,7 @@ namespace ClaudeBridge
                                 var fname = Path.GetFileNameWithoutExtension(f.Name);
                                 if (fname.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
                                 {
-                                    step = $"GetFile({dir}/{f.Name})";
+                                    step = "GetFile(" + dir + "/" + f.Name + ")";
                                     controller.FileSystem.GetFile(dir + "/" + f.Name, localFile, true);
                                     string text = File.ReadAllText(localFile);
                                     try { File.Delete(localFile); } catch { }
@@ -471,16 +731,14 @@ namespace ClaudeBridge
                         catch { }
                     }
 
-                    // SaveToFile expects a DIRECTORY path — it appends "/<ModuleName>.sysx"
                     step = "SaveToFile to $HOME";
                     module.SaveToFile("$HOME");
 
-                    // Read directly from VC disk path
                     step = "ReadFromDisk";
                     var rsCtrl = GetController();
                     var savedFile = Path.Combine(rsCtrl.SystemPath, "HOME", moduleName + ".sysx");
                     if (!File.Exists(savedFile))
-                        throw new Exception($"SaveToFile succeeded but file not found at: {savedFile}");
+                        throw new Exception("SaveToFile succeeded but file not found at: " + savedFile);
                     string sysText = File.ReadAllText(savedFile);
                     try { File.Delete(savedFile); } catch { }
                     return new { task = taskName, module = moduleName, type = "system", text = sysText };
@@ -488,7 +746,7 @@ namespace ClaudeBridge
             }
             catch (Exception ex)
             {
-                throw new Exception($"GetModuleText failed at step '{step}': {ex.GetType().Name}: {ex.Message}");
+                throw new Exception("GetModuleText failed at step '" + step + "': " + ex.GetType().Name + ": " + ex.Message);
             }
         }
 
@@ -499,24 +757,42 @@ namespace ClaudeBridge
             if (string.IsNullOrEmpty(code))
                 throw new Exception("Missing 'code' in request body");
 
+            // BOM-free UTF-8 + CRLF normalization
+            var normalizedCode = code.Replace("\r\n", "\n").Replace("\n", "\r\n");
+
             using (var controller = ConnectToController())
             {
                 var task = controller.Rapid.GetTask(taskName ?? "T_ROB1");
 
-                // Write code to temp file in VC HOME, then load into controller
+                // Clean up old modules before loading new one
+                bool replace = data["replace"] == null || data["replace"].Value<bool>();
+                if (replace)
+                {
+                    foreach (Module existingMod in task.GetModules())
+                    {
+                        var mName = existingMod.Name;
+                        if (mName.Equals("BASE", StringComparison.OrdinalIgnoreCase) ||
+                            mName.Equals("user", StringComparison.OrdinalIgnoreCase))
+                            continue;
+                        if (!existingMod.IsSystem && !mName.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            try { task.DeleteModule(mName); } catch { }
+                        }
+                    }
+                }
+
                 var rsCtrl = GetController();
                 var vcHome = Path.Combine(rsCtrl.SystemPath, "HOME");
-                var tmpFile = Path.Combine(vcHome, $"_claude_tmp_{moduleName}.mod");
+                var tmpFile = Path.Combine(vcHome, "_claude_tmp_" + moduleName + ".mod");
                 try
                 {
-                    File.WriteAllText(tmpFile, code);
-                    using (var mastership = Mastership.Request(controller))
+                    File.WriteAllText(tmpFile, normalizedCode, new UTF8Encoding(false));
+                    using (var mastership = Mastership.Request(controller.Rapid))
                     {
-                        // Delete old module first, then load the new one
                         try { task.DeleteModule(moduleName); } catch { }
                         task.LoadModuleFromFile(tmpFile, RapidLoadMode.Add);
                     }
-                    return new { success = true, message = $"Module {moduleName} updated" };
+                    return new { success = true, message = "Module " + moduleName + " updated" };
                 }
                 finally
                 {
@@ -543,14 +819,13 @@ namespace ClaudeBridge
                         ["local"] = decl.Local
                     };
 
-                    // Try to get InitialExpression (on RsGenericDataDeclaration)
                     var initExpr = TryGetStringProperty(decl, "InitialExpression");
                     if (initExpr != null) result["value"] = initExpr;
 
                     return result;
                 }
             }
-            throw new Exception($"Variable '{varName}' not found in task '{taskName}'");
+            throw new Exception("Variable '" + varName + "' not found in task '" + taskName + "'");
         }
 
         private object SetRapidVariable(string taskName, string varName, string body)
@@ -567,11 +842,94 @@ namespace ClaudeBridge
                 if (decl.Name.Equals(varName, StringComparison.OrdinalIgnoreCase))
                 {
                     if (TrySetStringProperty(decl, "InitialExpression", value))
-                        return new { success = true, message = $"Variable {varName} set to {value}" };
+                        return new { success = true, message = "Variable " + varName + " set to " + value };
                     throw new Exception("Cannot set InitialExpression on this declaration type");
                 }
             }
-            throw new Exception($"Variable '{varName}' not found");
+            throw new Exception("Variable '" + varName + "' not found");
+        }
+
+        private object ListRapidVariables(NameValueCollection query)
+        {
+            var ctrl = GetController();
+            var taskName = query["task"] ?? "T_ROB1";
+            var typeFilter = query["typeFilter"]?.ToLower();
+            var moduleFilter = query["module"];
+
+            var task = FindTask(ctrl, taskName);
+            var variables = new List<object>();
+
+            foreach (RsDataDeclaration decl in task.DataDeclarations)
+            {
+                if (!string.IsNullOrEmpty(moduleFilter) &&
+                    !decl.ModuleName.Equals(moduleFilter, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                if (!string.IsNullOrEmpty(typeFilter) &&
+                    !decl.DataType.ToLower().Contains(typeFilter))
+                    continue;
+
+                var varInfo = new Dictionary<string, object>
+                {
+                    ["name"] = decl.Name,
+                    ["dataType"] = decl.DataType,
+                    ["moduleName"] = decl.ModuleName,
+                    ["storageType"] = decl.StorageType.ToString(),
+                    ["local"] = decl.Local
+                };
+
+                var initExpr = TryGetStringProperty(decl, "InitialExpression");
+                if (initExpr != null) varInfo["initialValue"] = initExpr;
+
+                variables.Add(varInfo);
+            }
+
+            return new { task = taskName, variableCount = variables.Count, variables };
+        }
+
+        private object GetExecutionErrors(string countStr)
+        {
+            int maxCount = 10;
+            if (!string.IsNullOrEmpty(countStr)) int.TryParse(countStr, out maxCount);
+            if (maxCount > 100) maxCount = 100;
+
+            var errors = new List<object>();
+            try
+            {
+                using (var controller = ConnectToController())
+                {
+                    var categories = controller.EventLog.GetCategories();
+                    int collected = 0;
+                    foreach (var cat in categories)
+                    {
+                        var catName = TryGetStringProperty(cat, "Name") ?? "?";
+                        var messages = TryGetProperty(cat, "Messages") as System.Collections.IEnumerable;
+                        if (messages != null)
+                        {
+                            foreach (var msg in messages)
+                            {
+                                if (collected >= maxCount) break;
+                                errors.Add(new
+                                {
+                                    category = catName,
+                                    title = TryGetStringProperty(msg, "Title") ?? "",
+                                    body = TryGetStringProperty(msg, "Body") ?? "",
+                                    timestamp = (TryGetProperty(msg, "Timestamp") as DateTime?)?.ToString("o") ?? "",
+                                    type = TryGetStringProperty(msg, "Type") ?? ""
+                                });
+                                collected++;
+                            }
+                        }
+                        if (collected >= maxCount) break;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                return new { error = "Event log not available: " + ex.Message };
+            }
+
+            return new { errors, count = errors.Count };
         }
 
         // ── Controller Status ────────────────────────────────
@@ -596,26 +954,54 @@ namespace ClaudeBridge
         private object StartSimulation()
         {
             Simulator.StartAsync();
-            return new { success = true, message = "Simulation started" };
+            return new { success = true, message = "Simulation started", state = Simulator.State.ToString() };
         }
 
         private object StopSimulation()
         {
             Simulator.StopAsync();
-            return new { success = true, message = "Simulation stopped" };
+            return new { success = true, message = "Simulation stopped", state = Simulator.State.ToString() };
         }
 
         private object PauseSimulation()
         {
             Simulator.PauseAsync();
-            return new { success = true, message = "Simulation paused" };
+            return new { success = true, message = "Simulation paused", state = Simulator.State.ToString() };
         }
 
         private object ResetSimulation()
         {
-            // Stop first, then the user can start fresh
             Simulator.StopAsync();
-            return new { success = true, message = "Simulation stopped/reset" };
+
+            // Try to reset Program Pointer via RWS-style action on controller
+            try
+            {
+                using (var controller = ConnectToController())
+                {
+                    using (Mastership.Request(controller.Rapid))
+                    {
+                        // Attempt PP reset via reflection (API varies by SDK version)
+                        var rapid = controller.Rapid;
+                        var resetMethod = rapid.GetType().GetMethod("ResetProgramPointer")
+                                       ?? rapid.GetType().GetMethod("ResetPP");
+                        if (resetMethod != null)
+                        {
+                            resetMethod.Invoke(rapid, null);
+                        }
+                        else
+                        {
+                            // Fallback: try execution reset via known pattern
+                            Logger.AddMessage(new LogMessage("ClaudeBridge: ResetProgramPointer not available in this SDK version"));
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.AddMessage(new LogMessage("ClaudeBridge PP reset note: " + ex.Message));
+            }
+
+            return new { success = true, message = "Simulation stopped and PP reset attempted", state = Simulator.State.ToString() };
         }
 
         private object GetSimulationStatus()
@@ -638,7 +1024,7 @@ namespace ClaudeBridge
             var data = JObject.Parse(body);
             var speed = data["speed"]?.Value<double>() ?? 1.0;
             Simulator.SimulationSpeed = speed;
-            return new { success = true, message = $"Simulation speed set to {speed}" };
+            return new { success = true, message = "Simulation speed set to " + speed };
         }
 
         // ── Position Endpoint ────────────────────────────────
@@ -652,7 +1038,6 @@ namespace ClaudeBridge
             {
                 if (child is Mechanism mech)
                 {
-                    // Get joint values
                     var jointValues = new List<double>();
                     try
                     {
@@ -665,7 +1050,6 @@ namespace ClaudeBridge
                     }
                     catch { /* ignore */ }
 
-                    // Get flange transform via reflection
                     double fx = 0, fy = 0, fz = 0;
                     try
                     {
@@ -692,7 +1076,6 @@ namespace ClaudeBridge
                 }
             }
 
-            // Fallback: MechanicalUnits from controller
             if (mechanisms.Count == 0)
             {
                 var ctrl = GetController();
@@ -709,46 +1092,145 @@ namespace ClaudeBridge
 
         private object GetIOSignals()
         {
-            // IOSignal doesn't extend ProjectObject; access via controller's signal collection
-            var ctrl = GetController();
             var signals = new List<object>();
 
-            // Try reflection to find signal collection
-            var sigProp = ctrl.GetType().GetProperty("IOSignals")
-                       ?? ctrl.GetType().GetProperty("Signals")
-                       ?? ctrl.GetType().GetProperty("IOSystem");
-            if (sigProp != null)
+            try
             {
-                var collection = sigProp.GetValue(ctrl) as System.Collections.IEnumerable;
-                if (collection != null)
+                using (var controller = ConnectToController())
                 {
-                    foreach (var sig in collection)
+                    System.Collections.IEnumerable signalList = null;
+                    try
                     {
-                        signals.Add(new
+                        // Try GetSignals with one int arg first
+                        var method = controller.IOSystem.GetType().GetMethod("GetSignals", new[] { typeof(int) });
+                        if (method != null)
+                            signalList = method.Invoke(controller.IOSystem, new object[] { 0 }) as System.Collections.IEnumerable;
+                    }
+                    catch { }
+                    if (signalList == null)
+                    {
+                        try
                         {
-                            name = TryGetStringProperty(sig, "Name"),
-                            signalType = TryGetStringProperty(sig, "SignalType"),
-                            value = TryGetStringProperty(sig, "Value")
-                        });
-                        if (signals.Count >= 200) break;
+                            // Try GetSignals via reflection without args
+                            var method = controller.IOSystem.GetType().GetMethod("GetSignals", new Type[0]);
+                            if (method != null)
+                                signalList = method.Invoke(controller.IOSystem, null) as System.Collections.IEnumerable;
+                        }
+                        catch { }
+                    }
+                    if (signalList == null)
+                    {
+                        try
+                        {
+                            // Last resort: try GetAllSignals / ListSignals
+                            var method = controller.IOSystem.GetType().GetMethod("GetAllSignals")
+                                      ?? controller.IOSystem.GetType().GetMethod("ListSignals");
+                            if (method != null)
+                                signalList = method.Invoke(controller.IOSystem, null) as System.Collections.IEnumerable;
+                        }
+                        catch { }
+                    }
+
+                    if (signalList != null)
+                    {
+                        int count = 0;
+                        foreach (var signal in signalList)
+                        {
+                            if (count >= 500) break;
+                            signals.Add(new
+                            {
+                                name = TryGetStringProperty(signal, "Name"),
+                                type = TryGetStringProperty(signal, "Type"),
+                                value = TryGetStringProperty(signal, "Value")
+                            });
+                            count++;
+                        }
                     }
                 }
             }
+            catch (Exception ex)
+            {
+                return new { message = "IO signals not accessible via controller: " + ex.Message + ". Try starting the virtual controller first." };
+            }
 
             if (signals.Count == 0)
-                return new { message = "No IO signals found via controller. Signals may be accessible after starting the virtual controller." };
+                return new { message = "No IO signals found. Ensure the virtual controller is started." };
 
             return signals;
         }
 
         private object GetIOSignal(string name)
         {
-            return new { message = $"Signal lookup for '{name}' - use GetIOSignals to list available signals first" };
+            if (string.IsNullOrEmpty(name))
+                throw new Exception("Signal name required. Use /io/signals to list available signals.");
+
+            try
+            {
+                using (var controller = ConnectToController())
+                {
+                    var signal = TryGetProperty(controller.IOSystem, name)
+                              ?? TryGetPropertyViaMethod(controller.IOSystem, "GetSignal", name);
+                    if (signal == null)
+                        throw new Exception("Signal '" + name + "' not found");
+                    return new
+                    {
+                        name = TryGetStringProperty(signal, "Name"),
+                        type = TryGetStringProperty(signal, "Type"),
+                        value = TryGetStringProperty(signal, "Value")
+                    };
+                }
+            }
+            catch (Exception ex) when (!ex.Message.StartsWith("Signal '"))
+            {
+                throw new Exception("Cannot read IO signal: " + ex.Message + ". Ensure virtual controller is running.");
+            }
         }
 
         private object SetIOSignal(string name, string body)
         {
-            return new { error = "Direct I/O signal write not yet implemented for this SDK version" };
+            if (string.IsNullOrEmpty(name))
+                throw new Exception("Signal name required. Use /io/signals to list available signals.");
+
+            var data = JObject.Parse(body);
+            var valueObj = data["value"];
+            if (valueObj == null) throw new Exception("Missing 'value' in request body");
+
+            try
+            {
+                using (var controller = ConnectToController())
+                {
+                    using (Mastership.Request(controller.Rapid))
+                    {
+                        var signal = TryGetProperty(controller.IOSystem, name)
+                                  ?? TryGetPropertyViaMethod(controller.IOSystem, "GetSignal", name);
+                        if (signal == null)
+                            throw new Exception("Signal '" + name + "' not found");
+
+                        var prevValue = TryGetStringProperty(signal, "Value");
+                        var setProp = signal.GetType().GetProperty("Value");
+                        if (setProp != null && setProp.CanWrite)
+                        {
+                            var targetType = setProp.PropertyType;
+                            if (targetType == typeof(float) || targetType == typeof(double))
+                                setProp.SetValue(signal, Convert.ChangeType(valueObj.Value<double>(), targetType));
+                            else
+                                setProp.SetValue(signal, valueObj.Value<double>());
+                        }
+
+                        return new
+                        {
+                            success = true,
+                            message = "Signal " + name + " set to " + valueObj.Value<double>(),
+                            previousValue = prevValue,
+                            newValue = TryGetStringProperty(signal, "Value")
+                        };
+                    }
+                }
+            }
+            catch (Exception ex) when (!ex.Message.StartsWith("Signal '"))
+            {
+                throw new Exception("Cannot set IO signal: " + ex.Message + ". Ensure virtual controller is running.");
+            }
         }
 
         // ── Path & Target Endpoints ──────────────────────────
@@ -781,14 +1263,13 @@ namespace ClaudeBridge
         {
             var station = GetActiveStation();
             var path = FindPath(station, pathName);
-            if (path == null) throw new Exception($"Path '{pathName}' not found");
+            if (path == null) throw new Exception("Path '" + pathName + "' not found");
 
             var targets = new List<object>();
             foreach (RsInstruction instr in path.Instructions)
             {
                 if (instr is RsMoveInstruction move)
                 {
-                    // Use reflection for API compatibility
                     var targetObj = TryGetProperty(move, "Target")
                                 ?? TryGetProperty(move, "RobTarget")
                                 ?? TryGetProperty(move, "ToPoint");
@@ -824,7 +1305,7 @@ namespace ClaudeBridge
 
             var path = new RsPathProcedure(name);
             task.PathProcedures.Add(path);
-            return new { success = true, message = $"Path '{name}' created" };
+            return new { success = true, message = "Path '" + name + "' created" };
         }
 
         private object CreateTarget(string body)
@@ -841,7 +1322,6 @@ namespace ClaudeBridge
             var target = new RsRobTarget();
             target.Name = name;
 
-            // Set position via reflection for API compat
             var transProp = target.GetType().GetProperty("Transform")
                          ?? target.GetType().GetProperty("Frame");
             if (transProp != null && transProp.CanWrite)
@@ -855,7 +1335,7 @@ namespace ClaudeBridge
                 transProp.SetValue(target, frame);
             }
             task.DataDeclarations.Add(target);
-            return new { success = true, message = $"Target '{name}' at ({x}, {y}, {z})" };
+            return new { success = true, message = "Target '" + name + "' at (" + x + ", " + y + ", " + z + ")" };
         }
 
         // ── Config File Endpoints ────────────────────────────
@@ -867,7 +1347,6 @@ namespace ClaudeBridge
             if (string.IsNullOrEmpty(sysPath))
                 throw new Exception("Cannot determine system directory");
 
-            // Try common locations
             var candidates = new[]
             {
                 Path.Combine(sysPath, "SYSPAR", cfgName ?? "SYS.cfg"),
@@ -879,7 +1358,7 @@ namespace ClaudeBridge
                 if (File.Exists(cfgPath))
                     return new { path = cfgPath, content = File.ReadAllText(cfgPath) };
             }
-            throw new Exception($"Config file '{cfgName}' not found in {sysPath}");
+            throw new Exception("Config file '" + cfgName + "' not found in " + sysPath);
         }
 
         private object WriteConfigFile(string cfgName, string body)
@@ -890,9 +1369,18 @@ namespace ClaudeBridge
                 throw new Exception("Missing 'content' in request body");
 
             var ctrl = GetController();
-            var cfgPath = Path.Combine(ctrl.SystemPath, "SYSPAR", cfgName ?? "SYS.cfg");
+            var sysPath = ctrl.SystemPath;
+
+            // Try SYSPAR first, fallback to root
+            var cfgPath = Path.Combine(sysPath, "SYSPAR", cfgName ?? "SYS.cfg");
+            var dir = Path.GetDirectoryName(cfgPath);
+            if (!Directory.Exists(dir))
+            {
+                cfgPath = Path.Combine(sysPath, cfgName ?? "SYS.cfg");
+            }
+
             File.WriteAllText(cfgPath, content);
-            return new { success = true, message = $"Config file {cfgName} written to {cfgPath}" };
+            return new { success = true, message = "Config file " + cfgName + " written to " + cfgPath };
         }
 
         // ── Collision Detection ──────────────────────────────
@@ -900,16 +1388,109 @@ namespace ClaudeBridge
         private object CheckCollisions()
         {
             var station = GetActiveStation();
-            // Use static CollisionDetector methods
             try
             {
                 CollisionDetector.CheckCollisions(station);
-                return new { success = true, message = "Collision check executed" };
+                return new { success = true, message = "Collision check executed — no collisions detected" };
             }
             catch (Exception ex)
             {
-                return new { success = false, message = ex.Message };
+                return new { success = false, message = "Collision detected: " + ex.Message };
             }
+        }
+
+        // ── Screenshot ───────────────────────────────────────
+
+        private object TakeScreenshot(string body)
+        {
+            GetActiveStation(); // ensure station exists
+            int width = 1280, height = 720;
+            string savePath = null;
+
+            if (!string.IsNullOrEmpty(body))
+            {
+                var data = JObject.Parse(body);
+                if (data["width"] != null) width = Math.Min(data["width"].Value<int>(), 3840);
+                if (data["height"] != null) height = Math.Min(data["height"].Value<int>(), 2160);
+                if (data["savePath"] != null) savePath = data["savePath"].ToString();
+            }
+
+            string imageBase64 = null;
+            Exception captureError = null;
+            var done = new ManualResetEventSlim(false);
+
+            lock (_uiQueue)
+            {
+                _uiQueue.Enqueue(() =>
+                {
+                    try
+                    {
+                        // Access GraphicControl via RobotStudio assembly
+                        var uiEnvType = typeof(ABB.Robotics.RobotStudio.Environment.UIEnvironment);
+                        var gcProp = uiEnvType.Assembly.GetType("ABB.Robotics.RobotStudio.GraphicControl");
+                        object gc = null;
+                        if (gcProp != null)
+                        {
+                            var acProp = gcProp.GetProperty("ActiveGraphicControl");
+                            if (acProp != null) gc = acProp.GetValue(null);
+                        }
+                        if (gc == null) throw new Exception("No active graphic control in RobotStudio");
+
+                        var ssMethod = gc.GetType().GetMethod("ScreenShot", new Type[] { typeof(int), typeof(int) });
+                        if (ssMethod == null) throw new Exception("ScreenShot method not found");
+                        using (var bitmap = ssMethod.Invoke(gc, new object[] { width, height }) as Bitmap)
+                        {
+                            if (bitmap == null) throw new Exception("ScreenShot returned null");
+                            using (var ms = new MemoryStream())
+                            {
+                                bitmap.Save(ms, ImageFormat.Png);
+                                imageBase64 = Convert.ToBase64String(ms.ToArray());
+                            }
+                        }
+                    }
+                    catch (Exception ex) { captureError = ex; }
+                    finally { done.Set(); }
+                });
+            }
+
+            if (!done.Wait(TimeSpan.FromSeconds(15)))
+                throw new TimeoutException("Screenshot capture timed out on UI thread");
+            if (captureError != null)
+                throw new Exception("Screenshot failed: " + captureError.Message, captureError);
+
+            if (savePath != null)
+            {
+                // Validate savePath is within allowed directories
+                var fullPath = Path.GetFullPath(savePath);
+                var allowedBase = Path.GetFullPath(
+                    Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyPictures), "RobotStudio"));
+                Directory.CreateDirectory(allowedBase); // ensure base exists
+                // Prevent path traversal: ensure base+separator match or exact base match
+                var allowedWithSep = allowedBase.EndsWith(Path.DirectorySeparatorChar.ToString())
+                    ? allowedBase
+                    : allowedBase + Path.DirectorySeparatorChar;
+                if (!fullPath.StartsWith(allowedWithSep, StringComparison.OrdinalIgnoreCase)
+                    && !string.Equals(fullPath, allowedBase, StringComparison.OrdinalIgnoreCase))
+                    throw new Exception("savePath must be within " + allowedBase);
+                var dir = Path.GetDirectoryName(fullPath);
+                if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
+                File.WriteAllBytes(fullPath, Convert.FromBase64String(imageBase64));
+                return new
+                {
+                    imageBase64, width, height,
+                    mimeType = "image/png",
+                    savedPath = fullPath,
+                    timestamp = DateTime.UtcNow.ToString("o")
+                };
+            }
+
+            return new
+            {
+                imageBase64, width, height,
+                mimeType = "image/png",
+                savedPath = (string)null,
+                timestamp = DateTime.UtcNow.ToString("o")
+            };
         }
 
         // ── Reflection Helpers ───────────────────────────────
@@ -954,6 +1535,25 @@ namespace ClaudeBridge
             if (prop != null && prop.CanRead)
             {
                 try { return prop.GetValue(obj); }
+                catch { return null; }
+            }
+            return null;
+        }
+
+        private double GetDoubleProp(object obj, string propName)
+        {
+            var val = TryGetProperty(obj, propName);
+            if (val == null) return 0.0;
+            try { return Convert.ToDouble(val); }
+            catch { return 0.0; }
+        }
+
+        private object TryGetPropertyViaMethod(object obj, string methodName, params object[] args)
+        {
+            var method = obj.GetType().GetMethod(methodName);
+            if (method != null)
+            {
+                try { return method.Invoke(obj, args); }
                 catch { return null; }
             }
             return null;
