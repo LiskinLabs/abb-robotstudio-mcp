@@ -6,6 +6,7 @@ using System.Drawing.Imaging;
 using System.IO;
 using System.Linq;
 using System.Net;
+using System.Net.Http;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading;
@@ -721,27 +722,74 @@ namespace ClaudeBridge
 
                     if (!isSystem)
                     {
+                        bool found = false;
+
+                        // Strategy 1: SaveProgramToFile (needs program loaded)
                         step = "SaveProgramToFile";
-                        var remoteDir = "$HOME/_claude_tmp_prog";
                         try
                         {
+                            var remoteDir = "$HOME/_claude_tmp_prog";
                             task.SaveProgramToFile(remoteDir);
+                            step = "FindInSavedProgram";
+                            var files = controller.FileSystem.GetFilesAndDirectories(remoteDir + "/*");
+                            string foundRemote = null;
+                            foreach (var f in files)
+                            {
+                                var fname = Path.GetFileNameWithoutExtension(f.Name);
+                                if (fname.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                                { foundRemote = remoteDir + "/" + f.Name; break; }
+                            }
+                            if (foundRemote != null)
+                            {
+                                step = "GetFile(" + foundRemote + ")";
+                                controller.FileSystem.GetFile(foundRemote, localFile, true);
+                                string text = File.ReadAllText(localFile);
+                                try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
+                                try { File.Delete(localFile); } catch { }
+                                return new { task = taskName, module = moduleName, type = "program", text };
+                            }
+                            try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
                         }
                         catch (Exception saveEx)
                         {
-                            // Controller may not have a program loaded — try direct filesystem read
-                            Logger.AddMessage(new LogMessage("ClaudeBridge: SaveProgramToFile failed, trying filesystem: " + saveEx.Message));
-                            step = "SearchVCDisk";
-                            var diskCtrl = GetController();
-                            var searchDir = Path.Combine(diskCtrl.SystemPath, "HOME");
-                            if (Directory.Exists(searchDir))
+                            Logger.AddMessage(new LogMessage("ClaudeBridge: SaveProgramToFile failed: " + saveEx.Message));
+                        }
+
+                        // Strategy 2: Try module.SaveToFile via reflection
+                        if (!found && module != null)
+                        {
+                            step = "ModuleSaveToFile";
+                            try
                             {
-                                foreach (var f in Directory.GetFiles(searchDir, moduleName + ".*"))
+                                var saveMethod = module.GetType().GetMethod("SaveToFile", new[] { typeof(string) });
+                                if (saveMethod != null)
                                 {
-                                    string text = File.ReadAllText(f);
-                                    return new { task = taskName, module = moduleName, type = "program", text };
+                                    saveMethod.Invoke(module, new object[] { "$HOME" });
+                                    var saveCtrl = GetController();
+                                    var savedFile = Path.Combine(saveCtrl.SystemPath, "HOME", moduleName + ".sysx");
+                                    if (File.Exists(savedFile))
+                                    {
+                                        string text = File.ReadAllText(savedFile);
+                                        try { File.Delete(savedFile); } catch { }
+                                        return new { task = taskName, module = moduleName, type = "program", text };
+                                    }
                                 }
-                                foreach (var f in Directory.GetFiles(searchDir, "*.mod"))
+                            }
+                            catch (Exception modEx)
+                            {
+                                Logger.AddMessage(new LogMessage("ClaudeBridge: ModuleSaveToFile failed: " + modEx.Message));
+                            }
+                        }
+
+                        // Strategy 3: Search VC disk recursively
+                        step = "SearchVCDisk";
+                        var diskCtrl = GetController();
+                        var searchRoot = Path.Combine(diskCtrl.SystemPath, "HOME");
+                        if (Directory.Exists(searchRoot))
+                        {
+                            foreach (var pattern in new[] { "*.mod", "*.sys", "*.sysx", "*.pgf" })
+                            {
+                                foreach (var f in Directory.GetFiles(searchRoot, pattern, SearchOption.AllDirectories))
                                 {
                                     if (Path.GetFileNameWithoutExtension(f).Equals(moduleName, StringComparison.OrdinalIgnoreCase))
                                     {
@@ -750,32 +798,68 @@ namespace ClaudeBridge
                                     }
                                 }
                             }
-                            throw new Exception("Cannot read module '" + moduleName + "': " + saveEx.Message + ". Tried VC disk at " + searchDir);
                         }
-
-                        step = "FindInSavedProgram";
-                        var files = controller.FileSystem.GetFilesAndDirectories(remoteDir + "/*");
-                        string foundRemote = null;
-                        foreach (var f in files)
+                        // Strategy 4: Controller filesystem search
+                        step = "ControllerFS";
+                        try
                         {
-                            var fname = Path.GetFileNameWithoutExtension(f.Name);
-                            if (fname.Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                            var ctrlFS = GetController();
+                            var searchPaths = new[] { "$HOME", "$SYSTEM", "$SYSTEM/RAPID", "$HOME/_claude_tmp_prog" };
+                            foreach (var sp in searchPaths)
                             {
-                                foundRemote = remoteDir + "/" + f.Name;
-                                break;
+                                try
+                                {
+                                    var entries = controller.FileSystem.GetFilesAndDirectories(sp + "/*");
+                                    foreach (var entry in entries)
+                                    {
+                                        if (Path.GetFileNameWithoutExtension(entry.Name).Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                                        {
+                                            step = "GetFile(" + sp + "/" + entry.Name + ")";
+                                            controller.FileSystem.GetFile(sp + "/" + entry.Name, localFile, true);
+                                            string text = File.ReadAllText(localFile);
+                                            try { File.Delete(localFile); } catch { }
+                                            return new { task = taskName, module = moduleName, type = "program", text };
+                                        }
+                                    }
+                                }
+                                catch { /* path may not exist */ }
                             }
                         }
-
-                        if (foundRemote != null)
+                        catch (Exception fsEx)
                         {
-                            step = "GetFile(" + foundRemote + ")";
-                            controller.FileSystem.GetFile(foundRemote, localFile, true);
-                            string text = File.ReadAllText(localFile);
-                            try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
-                            try { File.Delete(localFile); } catch { }
-                            return new { task = taskName, module = moduleName, type = "program", text };
+                            Logger.AddMessage(new LogMessage("ClaudeBridge: ControllerFS search failed: " + fsEx.Message));
                         }
-                        try { controller.FileSystem.RemoveDirectory(remoteDir, true); } catch { }
+
+                        // Strategy 5: RWS REST API (reads directly from controller memory)
+                        step = "RWS";
+                        try
+                        {
+                            using (var http = new HttpClient { Timeout = TimeSpan.FromSeconds(10) })
+                            {
+                                var auth = Convert.ToBase64String(Encoding.ASCII.GetBytes("Default User:robotics"));
+                                http.DefaultRequestHeaders.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Basic", auth);
+                                var rwsUrl = "http://localhost:80/rw/rapid/tasks/" + Uri.EscapeDataString(taskName ?? "T_ROB1")
+                                    + "/modules/" + Uri.EscapeDataString(moduleName) + "/text";
+                                var resp = http.GetAsync(rwsUrl).Result;
+                                if (resp.IsSuccessStatusCode)
+                                {
+                                    var xml = resp.Content.ReadAsStringAsync().Result;
+                                    // Extract text from RWS XML response
+                                    var m = System.Text.RegularExpressions.Regex.Match(xml,
+                                        @"class=""module-text""[^>]*>([^<]*)<", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+                                    if (m.Success && m.Groups[1].Value.Trim().Length > 0)
+                                    {
+                                        return new { task = taskName, module = moduleName, type = "program", text = m.Groups[1].Value.Trim() };
+                                    }
+                                }
+                            }
+                        }
+                        catch (Exception rwsEx)
+                        {
+                            Logger.AddMessage(new LogMessage("ClaudeBridge: RWS fallback failed: " + rwsEx.Message));
+                        }
+
+                        throw new Exception("Cannot read module '" + moduleName + "'. Tried: SaveProgramToFile, ModuleSaveToFile, disk scan, controller FS, RWS API. VC path: " + searchRoot);
                     }
 
                     step = "SearchSystemModule";
