@@ -138,6 +138,7 @@ namespace ClaudeBridge
             string method = "GET";
             string path = "/";
             string body = null;
+            string origin = null;
             var query = new NameValueCollection();
             int statusCode = 200;
 
@@ -204,6 +205,8 @@ namespace ClaudeBridge
                                     var val = lines[i].Substring(colonIdx + 1).Trim();
                                     if (key.Equals("Content-Length", StringComparison.OrdinalIgnoreCase))
                                         int.TryParse(val, out contentLength);
+                                    else if (key.Equals("Origin", StringComparison.OrdinalIgnoreCase))
+                                        origin = val;
                                 }
                             }
 
@@ -238,6 +241,13 @@ namespace ClaudeBridge
                     path = path.TrimEnd('/').ToLower();
                     if (string.IsNullOrEmpty(path)) path = "/";
 
+                    // Handle CORS preflight
+                    if (method == "OPTIONS")
+                    {
+                        SendResponse(client, 200, new { status = "ok" }, origin);
+                        return;
+                    }
+
                     // Route to handler on UI thread
                     object result;
                     try
@@ -251,14 +261,14 @@ namespace ClaudeBridge
                         statusCode = 500;
                     }
 
-                    SendResponse(client, statusCode, result);
+                    SendResponse(client, statusCode, result, origin);
                 }
             }
             catch (Exception ex)
             {
                 try
                 {
-                    SendResponse(client, 500, new { error = "Internal server error: " + ex.Message });
+                    SendResponse(client, 500, new { error = "Internal server error: " + ex.Message }, origin);
                 }
                 catch { /* best effort */ }
             }
@@ -278,7 +288,7 @@ namespace ClaudeBridge
             }
         }
 
-        private static void SendResponse(TcpClient client, int statusCode, object data)
+        private static void SendResponse(TcpClient client, int statusCode, object data, string origin = null)
         {
             try
             {
@@ -291,6 +301,22 @@ namespace ClaudeBridge
                 var sb = new StringBuilder();
                 sb.Append("HTTP/1.1 " + statusCode + " " + statusText + "\r\n");
                 sb.Append("Content-Type: application/json; charset=utf-8\r\n");
+
+                // Dynamic CORS: echo Origin back only if localhost
+                if (!string.IsNullOrEmpty(origin))
+                {
+                    var isLocalhost = origin.StartsWith("http://localhost", StringComparison.OrdinalIgnoreCase) ||
+                                      origin.StartsWith("http://127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
+                                      origin.StartsWith("tauri://localhost", StringComparison.OrdinalIgnoreCase) ||
+                                      origin == "https://tauri.localhost" ||
+                                      origin == "https://localhost";
+                    if (isLocalhost)
+                    {
+                        sb.Append("Access-Control-Allow-Origin: " + origin + "\r\n");
+                        sb.Append("Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n");
+                        sb.Append("Access-Control-Allow-Headers: Content-Type\r\n");
+                    }
+                }
                 sb.Append("Content-Length: " + jsonBytes.Length + "\r\n");
                 sb.Append("Connection: close\r\n");
                 sb.Append("\r\n");
@@ -432,9 +458,16 @@ namespace ClaudeBridge
                 }
             }
 
-            var controller = Controller.Connect(ctrlInfo, ConnectionType.Standalone, false);
-            controller.Logon(UserInfo.DefaultUser);
-            return controller;
+            try
+            {
+                var controller = Controller.Connect(ctrlInfo, ConnectionType.Standalone, false);
+                controller.Logon(UserInfo.DefaultUser);
+                return controller;
+            }
+            catch (ObjectDisposedException)
+            {
+                throw new Exception("Controller connection was disposed. The virtual controller may be restarting. Try again in a moment.");
+            }
         }
 
         private RsTask FindTask(RsIrc5Controller ctrl, string taskName)
@@ -666,20 +699,59 @@ namespace ClaudeBridge
                     var task = controller.Rapid.GetTask(taskName ?? "T_ROB1");
 
                     step = "GetModule(" + moduleName + ")";
-                    var module = task.GetModule(moduleName);
-                    if (module == null)
-                        throw new Exception("Module '" + moduleName + "' not found in task '" + taskName + "'");
+                    object module = null;
+                    bool isSystem = false;
+                    try
+                    {
+                        module = task.GetModule(moduleName);
+                        if (module == null)
+                            isSystem = true; // treat as system module
+                        else
+                            isSystem = TryGetStringProperty(module, "IsSystem") == "True";
+                    }
+                    catch
+                    {
+                        // System modules may throw on GetModule — treat as system
+                        isSystem = true;
+                    }
 
                     var localDir = Path.Combine(Path.GetTempPath(), "claude_rapid");
                     Directory.CreateDirectory(localDir);
                     var localFile = Path.Combine(localDir, moduleName + ".mod");
-                    bool isSystem = module.IsSystem;
 
                     if (!isSystem)
                     {
                         step = "SaveProgramToFile";
                         var remoteDir = "$HOME/_claude_tmp_prog";
-                        task.SaveProgramToFile(remoteDir);
+                        try
+                        {
+                            task.SaveProgramToFile(remoteDir);
+                        }
+                        catch (Exception saveEx)
+                        {
+                            // Controller may not have a program loaded — try direct filesystem read
+                            Logger.AddMessage(new LogMessage("ClaudeBridge: SaveProgramToFile failed, trying filesystem: " + saveEx.Message));
+                            step = "SearchVCDisk";
+                            var diskCtrl = GetController();
+                            var searchDir = Path.Combine(diskCtrl.SystemPath, "HOME");
+                            if (Directory.Exists(searchDir))
+                            {
+                                foreach (var f in Directory.GetFiles(searchDir, moduleName + ".*"))
+                                {
+                                    string text = File.ReadAllText(f);
+                                    return new { task = taskName, module = moduleName, type = "program", text };
+                                }
+                                foreach (var f in Directory.GetFiles(searchDir, "*.mod"))
+                                {
+                                    if (Path.GetFileNameWithoutExtension(f).Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                                    {
+                                        string text = File.ReadAllText(f);
+                                        return new { task = taskName, module = moduleName, type = "program", text };
+                                    }
+                                }
+                            }
+                            throw new Exception("Cannot read module '" + moduleName + "': " + saveEx.Message + ". Tried VC disk at " + searchDir);
+                        }
 
                         step = "FindInSavedProgram";
                         var files = controller.FileSystem.GetFilesAndDirectories(remoteDir + "/*");
@@ -731,16 +803,39 @@ namespace ClaudeBridge
                     }
 
                     step = "SaveToFile to $HOME";
-                    module.SaveToFile("$HOME");
+                    if (module != null)
+                    {
+                        var saveMethod = module.GetType().GetMethod("SaveToFile", new[] { typeof(string) });
+                        if (saveMethod != null)
+                            saveMethod.Invoke(module, new object[] { "$HOME" });
+                        else
+                            throw new Exception("SaveToFile method not found on " + module.GetType().FullName);
+                        step = "ReadFromDisk";
+                        var rsCtrl = GetController();
+                        var savedFile = Path.Combine(rsCtrl.SystemPath, "HOME", moduleName + ".sysx");
+                        if (File.Exists(savedFile))
+                        {
+                            string sysText = File.ReadAllText(savedFile);
+                            try { File.Delete(savedFile); } catch { }
+                            return new { task = taskName, module = moduleName, type = "system", text = sysText };
+                        }
+                    }
 
-                    step = "ReadFromDisk";
-                    var rsCtrl = GetController();
-                    var savedFile = Path.Combine(rsCtrl.SystemPath, "HOME", moduleName + ".sysx");
-                    if (!File.Exists(savedFile))
-                        throw new Exception("SaveToFile succeeded but file not found at: " + savedFile);
-                    string sysText = File.ReadAllText(savedFile);
-                    try { File.Delete(savedFile); } catch { }
-                    return new { task = taskName, module = moduleName, type = "system", text = sysText };
+                    // Last resort: read directly from VC disk
+                    var ctrl = GetController();
+                    var homePath = Path.Combine(ctrl.SystemPath, "HOME");
+                    if (Directory.Exists(homePath))
+                    {
+                        foreach (var f in Directory.GetFiles(homePath, "*.*"))
+                        {
+                            if (Path.GetFileNameWithoutExtension(f).Equals(moduleName, StringComparison.OrdinalIgnoreCase))
+                            {
+                                string text = File.ReadAllText(f);
+                                return new { task = taskName, module = moduleName, type = "system", text };
+                            }
+                        }
+                    }
+                    throw new Exception("Could not read module '" + moduleName + "' — tried SaveToFile and disk scan in " + homePath);
                 }
             }
             catch (Exception ex)
