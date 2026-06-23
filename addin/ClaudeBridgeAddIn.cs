@@ -156,12 +156,13 @@ namespace ClaudeBridge
                     bool headersComplete = false;
                     int contentLength = 0;
 
+                    int lastBytesRead = 0;
                     while (totalRead < 65536 && !headersComplete)
                     {
-                        int bytesRead = stream.Read(buffer, 0, buffer.Length);
-                        if (bytesRead == 0) break;
-                        headerBuffer.Append(Encoding.ASCII.GetString(buffer, 0, bytesRead));
-                        totalRead += bytesRead;
+                        lastBytesRead = stream.Read(buffer, 0, buffer.Length);
+                        if (lastBytesRead == 0) break;
+                        headerBuffer.Append(Encoding.ASCII.GetString(buffer, 0, lastBytesRead));
+                        totalRead += lastBytesRead;
 
                         var text = headerBuffer.ToString();
                         int headerEnd = text.IndexOf("\r\n\r\n");
@@ -206,32 +207,30 @@ namespace ClaudeBridge
                                 }
                             }
 
-                            // Read remaining body if not already in buffer
+                            // Read body: headerEnd+4 is where body starts in accumulated text
+                            // Body bytes in the last buffer read start at offset: lastBytesRead - (totalRead - headerEnd - 4)
                             if (contentLength > 0)
                             {
-                                var bodyStart = headerEnd + 4; // after \r\n\r\n
-                                var alreadyRead = totalRead - bodyStart;
-
+                                var headerLen = headerEnd + 4; // includes \r\n\r\n
+                                var bodyInLastRead = totalRead - headerLen;
                                 var bodyBytes = new byte[contentLength];
-                                if (alreadyRead > 0)
+                                int bodyPos = 0;
+
+                                if (bodyInLastRead > 0)
                                 {
-                                    var headerBytes = Encoding.ASCII.GetBytes(headerSection + "\r\n\r\n");
-                                    var remainingStart = totalRead - alreadyRead;
-                                    // Copy trailing bytes that are actually body
-                                    var bodyInBuffer = Math.Min(alreadyRead, contentLength);
-                                    Array.Copy(buffer, buffer.Length - (totalRead - remainingStart),
-                                        bodyBytes, 0, bodyInBuffer);
+                                    int bufferBodyStart = lastBytesRead - bodyInLastRead;
+                                    int copyCount = Math.Min(bodyInLastRead, contentLength);
+                                    Array.Copy(buffer, bufferBodyStart, bodyBytes, 0, copyCount);
+                                    bodyPos = copyCount;
                                 }
 
-                                // Read remaining body bytes
-                                int bodyRead = Math.Min(alreadyRead, contentLength);
-                                while (bodyRead < contentLength)
+                                while (bodyPos < contentLength)
                                 {
-                                    int n = stream.Read(bodyBytes, bodyRead, contentLength - bodyRead);
+                                    int n = stream.Read(bodyBytes, bodyPos, contentLength - bodyPos);
                                     if (n == 0) break;
-                                    bodyRead += n;
+                                    bodyPos += n;
                                 }
-                                body = Encoding.UTF8.GetString(bodyBytes);
+                                body = Encoding.UTF8.GetString(bodyBytes, 0, bodyPos);
                             }
                         }
                     }
@@ -1417,46 +1416,18 @@ namespace ClaudeBridge
 
             string imageBase64 = null;
             Exception captureError = null;
-            var done = new ManualResetEventSlim(false);
 
-            lock (_uiQueue)
+            // Route runs on UI thread via _uiQueue/OnIdle, so we can call
+            // RobotStudio APIs directly without queuing another action.
+            // (Queuing to _uiQueue from inside Route would deadlock.)
+            try
             {
-                _uiQueue.Enqueue(() =>
-                {
-                    try
-                    {
-                        // Access GraphicControl via RobotStudio assembly
-                        var uiEnvType = typeof(ABB.Robotics.RobotStudio.Environment.UIEnvironment);
-                        var gcProp = uiEnvType.Assembly.GetType("ABB.Robotics.RobotStudio.GraphicControl");
-                        object gc = null;
-                        if (gcProp != null)
-                        {
-                            var acProp = gcProp.GetProperty("ActiveGraphicControl");
-                            if (acProp != null) gc = acProp.GetValue(null);
-                        }
-                        if (gc == null) throw new Exception("No active graphic control in RobotStudio");
-
-                        var ssMethod = gc.GetType().GetMethod("ScreenShot", new Type[] { typeof(int), typeof(int) });
-                        if (ssMethod == null) throw new Exception("ScreenShot method not found");
-                        using (var bitmap = ssMethod.Invoke(gc, new object[] { width, height }) as Bitmap)
-                        {
-                            if (bitmap == null) throw new Exception("ScreenShot returned null");
-                            using (var ms = new MemoryStream())
-                            {
-                                bitmap.Save(ms, ImageFormat.Png);
-                                imageBase64 = Convert.ToBase64String(ms.ToArray());
-                            }
-                        }
-                    }
-                    catch (Exception ex) { captureError = ex; }
-                    finally { done.Set(); }
-                });
+                TakeScreenshotInternal(width, height, out imageBase64);
             }
-
-            if (!done.Wait(TimeSpan.FromSeconds(15)))
-                throw new TimeoutException("Screenshot capture timed out on UI thread");
-            if (captureError != null)
-                throw new Exception("Screenshot failed: " + captureError.Message, captureError);
+            catch (Exception ex)
+            {
+                throw new Exception("Screenshot failed: " + ex.Message, ex);
+            }
 
             if (savePath != null)
             {
@@ -1491,6 +1462,49 @@ namespace ClaudeBridge
                 savedPath = (string)null,
                 timestamp = DateTime.UtcNow.ToString("o")
             };
+        }
+
+        private void TakeScreenshotInternal(int width, int height, out string imageBase64)
+        {
+            imageBase64 = null;
+
+            // Search all loaded assemblies for GraphicControl type
+            Type gcType = null;
+            foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+            {
+                try
+                {
+                    gcType = asm.GetType("ABB.Robotics.RobotStudio.GraphicControl");
+                    if (gcType == null)
+                        gcType = asm.GetTypes().FirstOrDefault(t => t.Name == "GraphicControl");
+                }
+                catch { }
+                if (gcType != null) break;
+            }
+            if (gcType == null)
+                throw new Exception("GraphicControl type not found in any loaded assembly. Available types with 'Graphic': " +
+                    string.Join(", ", AppDomain.CurrentDomain.GetAssemblies()
+                        .SelectMany(a => { try { return a.GetTypes(); } catch { return new Type[0]; } })
+                        .Where(t => t.Name.Contains("Graphic") || t.Name.Contains("Screen"))
+                        .Take(10).Select(t => t.FullName)));
+
+            var acProp = gcType.GetProperty("ActiveGraphicControl");
+            if (acProp == null) throw new Exception("ActiveGraphicControl property not found");
+            object gc = acProp.GetValue(null);
+            if (gc == null) throw new Exception("No active graphic control — open a station with 3D view");
+
+            var ssMethod = gc.GetType().GetMethod("ScreenShot", new Type[] { typeof(int), typeof(int) });
+            if (ssMethod == null) throw new Exception("ScreenShot method not found on " + gc.GetType().FullName);
+
+            using (var bitmap = ssMethod.Invoke(gc, new object[] { width, height }) as Bitmap)
+            {
+                if (bitmap == null) throw new Exception("ScreenShot returned null");
+                using (var ms = new MemoryStream())
+                {
+                    bitmap.Save(ms, ImageFormat.Png);
+                    imageBase64 = Convert.ToBase64String(ms.ToArray());
+                }
+            }
         }
 
         // ── Reflection Helpers ───────────────────────────────

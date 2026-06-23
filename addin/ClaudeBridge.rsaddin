@@ -1,13 +1,12 @@
 <?xml version="1.0" encoding="utf-8" ?>
-<RobotStudioAddIn xmlns="urn:abb-robotics-robotstudio-addin"
-                  xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                  xsi:schemaLocation="urn:abb-robotics-robotstudio-addin RobotStudioAddIn.xsd">
+<RobotStudioAddIn xmlns="urn:abb-robotics-robotstudio-addin">
+  <DisplayName>ClaudeBridge</DisplayName>
+  <DisplayVersion>2.0.0</DisplayVersion>
+  <Description>MCP Bridge — 55 tools for AI-assisted RobotStudio control (TcpListener)</Description>
   <Assembly>
     <FileName>ClaudeBridge.dll</FileName>
+    <Entrypoint>ClaudeBridge.ClaudeBridgeAddIn.AddinMain</Entrypoint>
   </Assembly>
   <AddInType>General</AddInType>
   <Dependencies>Online</Dependencies>
-  <Platform>Any</Platform>
-  <EntryMethod>ClaudeBridge.ClaudeBridgeAddIn.AddinMain</EntryMethod>
-  <AutoLoad>true</AutoLoad>
 </RobotStudioAddIn>
