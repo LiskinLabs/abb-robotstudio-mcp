@@ -1,6 +1,6 @@
 # ABB RobotStudio MCP Server — LiskinLabs Edition
 
-> **v2.1.0** — Fork of [eliasbitsch/abb-robotstudio-mcp](https://github.com/eliasbitsch/abb-robotstudio-mcp) with TcpListener transport, 55 MCP tools, AutoLoad, and security hardening.
+> **v2.0.0** — Fork of [eliasbitsch/abb-robotstudio-mcp](https://github.com/eliasbitsch/abb-robotstudio-mcp) with TcpListener transport, 55 MCP tools, AutoLoad, and security hardening.
 
 Model Context Protocol server for ABB RobotStudio and ABB robot controllers.
 
@@ -13,9 +13,9 @@ Tested: ABB RobotStudio 2025 + IRB 4600 Virtual Controller (IRC5).
 
 ---
 
-## ✨ Improvements over original
+## ✨ Improvements over original v1.0.0
 
-| Feature | Original v1.0.0 | LiskinLabs v2.1.0 |
+| Feature | Original | LiskinLabs v2.0.0 |
 |---|---|---|
 | HTTP Transport | `HttpListener` — needs `netsh http add urlacl` (admin) | **`TcpListener`** — zero admin rights |
 | Tools | 50 | **55** (+5 new) |
@@ -31,7 +31,7 @@ Tested: ABB RobotStudio 2025 + IRB 4600 Virtual Controller (IRC5).
 | Path validation | N/A | ✅ Screenshot sandboxed |
 | CORS | N/A | ✅ Removed (not a browser API) |
 
-## New MCP Tools in v2.1.0
+## New MCP Tools in v2.0.0
 
 | Tool | Description |
 |---|---|

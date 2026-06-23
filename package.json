@@ -1,7 +1,7 @@
 {
   "name": "abb-robotstudio-mcp",
-  "version": "1.0.0",
-  "description": "MCP server for ABB RobotStudio via Robot Web Services (RWS)",
+  "version": "2.0.0",
+  "description": "MCP server for ABB RobotStudio — 55 tools (SDK + RWS), TcpListener Add-In",
   "type": "module",
   "main": "dist/index.js",
   "bin": "dist/index.js",

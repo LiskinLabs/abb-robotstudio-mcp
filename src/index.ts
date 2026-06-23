@@ -5,7 +5,7 @@
  * - SDK tools (rs_*): Control RobotStudio app via ClaudeBridge Add-In (TcpListener)
  * - RWS tools (rws_*): Control the robot controller via Robot Web Services
  *
- * v2.1.0 — TcpListener bridge with AbortController timeouts, new tools
+ * v2.0.0 — TcpListener bridge with AbortController timeouts, 55 tools
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -131,7 +131,7 @@ function err(e: any, context?: string) {
 
 const server = new McpServer({
   name: "abb-robotstudio",
-  version: "2.1.0",
+  version: "2.0.0",
 });
 
 // ═══════════════════════════════════════════════════════════════
