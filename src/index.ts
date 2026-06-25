@@ -5,112 +5,21 @@
  * - SDK tools (rs_*): Control RobotStudio app via ClaudeBridge Add-In (TcpListener)
  * - RWS tools (rws_*): Control the robot controller via Robot Web Services
  *
- * v2.0.0 — TcpListener bridge with AbortController timeouts, 55 tools
+ * v3.0.0 — Safety-first: RAPID validation, simulation guard, runtime URL switching
  */
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 
-// ── Configuration ────────────────────────────────────────────
-
-const BRIDGE_URL = process.env.ABB_BRIDGE_URL || "http://localhost:58080";
-const RWS_URL = process.env.ABB_RWS_URL || "http://localhost:80";
-const RWS_USER = process.env.ABB_RWS_USER || "Default User";
-const RWS_PASS = process.env.ABB_RWS_PASS || "robotics";
-
-// ── SDK Bridge Client (Add-In HTTP) ─────────────────────────
-
-async function bridge(
-  path: string,
-  method: "GET" | "POST" = "GET",
-  body?: object,
-  timeoutMs: number = 15000
-): Promise<any> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-
-  try {
-    const res = await fetch(`${BRIDGE_URL}${path}`, {
-      method,
-      headers: body ? { "Content-Type": "application/json" } : {},
-      body: body ? JSON.stringify(body) : null,
-      signal: controller.signal,
-    });
-    const json = (await res.json()) as Record<string, unknown>;
-    if (json.error) throw new Error(String(json.error));
-    return json;
-  } catch (e: any) {
-    if (e.name === "AbortError") {
-      throw new Error(
-        `Request to ClaudeBridge timed out after ${timeoutMs}ms. The RobotStudio UI thread may be busy.`
-      );
-    }
-    if (e.cause?.code === "ECONNREFUSED") {
-      throw new Error(
-        `Cannot connect to ClaudeBridge at ${BRIDGE_URL}. Is RobotStudio running with the Add-In loaded?`
-      );
-    }
-    throw e;
-  } finally {
-    clearTimeout(timer);
-  }
-}
-
-// ── RWS Client (Robot Web Services REST) ────────────────────
-
-const rwsAuth =
-  "Basic " + Buffer.from(`${RWS_USER}:${RWS_PASS}`).toString("base64");
-let rwsCookie = "";
-
-async function rws(
-  methodOrPath: string,
-  pathOrBody?: string,
-  bodyOrCt?: string,
-  ct?: string
-): Promise<{ status: number; body: string }> {
-  let method: string, path: string, body: string | undefined, contentType: string | undefined;
-  if (methodOrPath === "GET" || methodOrPath === "POST" || methodOrPath === "PUT") {
-    method = methodOrPath; path = pathOrBody!; body = bodyOrCt; contentType = ct;
-  } else {
-    method = "GET"; path = methodOrPath; body = pathOrBody; contentType = bodyOrCt;
-  }
-  const headers: Record<string, string> = {
-    Authorization: rwsAuth,
-    Accept: "application/xhtml+xml;v=2.0",
-  };
-  if (rwsCookie) headers["Cookie"] = rwsCookie;
-  if (body && contentType) headers["Content-Type"] = contentType;
-
-  const res = await fetch(`${RWS_URL}${path}`, {
-    method,
-    headers,
-    body: body ?? null,
-  });
-
-  const setCookie = res.headers.getSetCookie();
-  for (const c of setCookie) {
-    if (c.includes("ABBCX") || c.includes("-http-session"))
-      rwsCookie = c.split(";")[0] ?? "";
-  }
-
-  return { status: res.status, body: await res.text() };
-}
-
-function rwsExtract(xml: string, tag: string): string {
-  const m =
-    xml.match(new RegExp(`class="${tag}"[^>]*>([^<]*)<`, "i")) ??
-    xml.match(new RegExp(`<${tag}[^>]*>([^<]*)</${tag}>`, "i"));
-  return m?.[1]?.trim() ?? "";
-}
-
-function rwsExtractAll(xml: string, field: string): string[] {
-  const results: string[] = [];
-  const re = new RegExp(`class="${field}"[^>]*>([^<]*)<`, "gi");
-  let m;
-  while ((m = re.exec(xml)) !== null) results.push((m[1] ?? "").trim());
-  return results;
-}
+import { BRIDGE_URL, getRwsUrl, setRwsUrl, LARGE_MODULE_THRESHOLD } from "./config.js";
+import { bridge } from "./bridge-client.js";
+import {
+  rws, rwsExtract, rwsExtractAll, rwsPostForm,
+  resetRwsSession, mastershipRequest, mastershipRelease,
+} from "./rws-client.js";
+import { validateRapidCode } from "./rapid-validator.js";
+import { checkSimulationSafety, checkExecutionSafety } from "./safety-guard.js";
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -127,15 +36,71 @@ function err(e: any, context?: string) {
   };
 }
 
-// ── MCP Server ───────────────────────────────────────────────
+// ── RAPID Validation Helper ──────────────────────────────────
+
+function validateOrReject(code: string, skipValidation?: boolean): { valid: true } | { valid: false; error: any } {
+  if (skipValidation) return { valid: true };
+  const v = validateRapidCode(code);
+  if (!v.valid) {
+    return {
+      valid: false,
+      error: {
+        error: `RAPID syntax validation failed (${v.errors.length} error(s))`,
+        validationErrors: v.errors,
+        warnings: v.warnings,
+        lineCount: v.lineCount,
+        hint: "Set skipValidation=true to bypass this check",
+      },
+    };
+  }
+  return { valid: true };
+}
+
+// ── Large Module Upload via RWS File Service ─────────────────
+
+async function uploadLargeModule(task: string, module: string, code: string): Promise<any> {
+  // Validate module name to prevent path traversal
+  if (module.includes("..") || !/^[a-zA-Z0-9_\-]+$/.test(module)) {
+    throw new Error(`Invalid module name "${module}" — must contain only [a-zA-Z0-9_-] and no ".."`);
+  }
+  const remoteDir = "$HOME/_claude_upload";
+  const remoteFile = `${remoteDir}/${module}.mod`;
+
+  try {
+    // Upload .mod file to controller filesystem
+    await rws("PUT", `/fileservice/${encodeURIComponent(remoteFile)}`, code, "text/plain");
+
+    // Request mastership and load module from file
+    await mastershipRequest("rapid");
+    try {
+      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=loadmod`, {
+        modulepath: remoteFile,
+        replace: "true",
+      });
+      return { success: true, message: `Module ${module} loaded via RWS file upload (${r.status})` };
+    } finally {
+      await mastershipRelease("rapid").catch(() => {});
+      // Clean up temp file
+      await rws("POST", `/fileservice/${encodeURIComponent(remoteDir)}?action=remove`).catch(() => {});
+    }
+  } catch (e: any) {
+    // Clean up on error
+    try { await rws("POST", `/fileservice/${encodeURIComponent(remoteDir)}?action=remove`); } catch {}
+    throw e;
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// ██  MCP SERVER                                                ██
+// ═══════════════════════════════════════════════════════════════
 
 const server = new McpServer({
   name: "abb-robotstudio",
-  version: "2.0.0",
+  version: "3.0.0",
 });
 
 // ═══════════════════════════════════════════════════════════════
-// ██  SDK TOOLS (rs_*) — RobotStudio Application via Add-In  ██
+// ██  SDK TOOLS (rs_*) — RobotStudio via Add-In                ██
 // ═══════════════════════════════════════════════════════════════
 
 server.tool("rs_ping", "Check if RobotStudio ClaudeBridge Add-In is running and connected", {},
@@ -184,11 +149,44 @@ server.tool("rs_read_module", "Read full RAPID source code of a module (SDK)",
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_write_module", "Write RAPID module source code into running controller (SDK)",
-  { task: z.string(), module: z.string(), code: z.string().describe("Full RAPID code (MODULE ... ENDMODULE)"),
-    replace: z.boolean().optional().describe("Replace existing modules (default: true)") },
-  async ({ task, module, code, replace }) => { try {
-    return ok(await bridge(`/rapid/module/text?task=${encodeURIComponent(task)}&module=${encodeURIComponent(module)}`, "POST", { code, replace }, 30000));
+// ── rs_write_module (ENHANCED: RAPID validation + large-module fallback) ──
+
+server.tool("rs_write_module", "Write RAPID module source code into running controller (SDK). Auto-validates RAPID syntax and uses file upload for large modules.",
+  {
+    task: z.string(),
+    module: z.string(),
+    code: z.string().describe("Full RAPID code (MODULE ... ENDMODULE)"),
+    replace: z.boolean().optional().describe("Replace existing modules (default: true)"),
+    skipValidation: z.boolean().optional().describe("Skip RAPID syntax validation (default: false)"),
+    useFileUpload: z.boolean().optional().describe("Force file-based upload via RWS (for very large modules)"),
+  },
+  async ({ task, module, code, replace, skipValidation, useFileUpload }) => { try {
+    // 1. Validate RAPID syntax
+    const v = validateOrReject(code, skipValidation);
+    if (!v.valid) return err(new Error(JSON.stringify(v.error, null, 2)), "RAPID Validation");
+
+    // 2. Choose upload method
+    const isLarge = code.length > LARGE_MODULE_THRESHOLD;
+    if (useFileUpload || isLarge) {
+      try {
+        return ok(await uploadLargeModule(task, module, code));
+      } catch (fileErr: any) {
+        // Fallback: try SDK bridge if file upload fails
+        if (!useFileUpload) {
+          return ok(await bridge(
+            `/rapid/module/text?task=${encodeURIComponent(task)}&module=${encodeURIComponent(module)}`,
+            "POST", { code, replace }, 30000
+          ));
+        }
+        throw fileErr;
+      }
+    }
+
+    // 3. Standard SDK bridge upload
+    return ok(await bridge(
+      `/rapid/module/text?task=${encodeURIComponent(task)}&module=${encodeURIComponent(module)}`,
+      "POST", { code, replace }, 30000
+    ));
   } catch (e: any) { return err(e); } }
 );
 
@@ -230,9 +228,8 @@ server.tool("rs_get_screenshot", "Capture 3D view screenshot as base64 PNG (SDK)
     height: z.number().optional().describe("Height in pixels (default: 720, max: 2160)") },
   async ({ width, height }) => { try {
     const result = await bridge("/screenshot", "POST", {
-      width: width || 1280,
-      height: height || 720,
-    }, 20000);
+      width: width || 1280, height: height || 720,
+    }, 20000) as any;
     return {
       content: [
         { type: "image" as const, data: result.imageBase64, mimeType: result.mimeType || "image/png" },
@@ -250,8 +247,24 @@ server.tool("rs_controller_status", "Get controller state via SDK (systemState, 
   async () => { try { return ok(await bridge("/controller/status")); } catch (e: any) { return err(e); } }
 );
 
-server.tool("rs_start_simulation", "Start RobotStudio simulation (Play)", {},
-  async () => { try { return ok(await bridge("/simulation/start", "POST")); } catch (e: any) { return err(e); } }
+// ── rs_start_simulation (ENHANCED: safety guard) ──
+
+server.tool("rs_start_simulation", "Start RobotStudio simulation (Play). Blocks if RAPID errors detected — use force=true to override.",
+  {
+    force: z.boolean().optional().describe("Skip safety check and force start even with errors (default: false)"),
+  },
+  async ({ force }) => { try {
+    if (!force) {
+      const safety = await checkSimulationSafety();
+      if (!safety.safe) {
+        return err(
+          new Error(`Safety check blocked simulation: ${safety.reason}\nHint: Set force=true to override`),
+          "SafetyGuard"
+        );
+      }
+    }
+    return ok(await bridge("/simulation/start", "POST"));
+  } catch (e: any) { return err(e); } }
 );
 
 server.tool("rs_stop_simulation", "Stop RobotStudio simulation", {},
@@ -332,18 +345,51 @@ server.tool("rs_get_io_signals", "List I/O signals via SDK", {},
   async () => { try { return ok(await bridge("/io/signals")); } catch (e: any) { return err(e); } }
 );
 
+// ── NEW: RAPID Validation ────────────────────────────────────
+
+server.tool("rs_validate_rapid", "Validate RAPID source code syntax (block balance: IF/ENDIF, PROC/ENDPROC, etc.)",
+  { code: z.string().describe("Full RAPID source code to validate") },
+  async ({ code }) => { try {
+    return ok(validateRapidCode(code));
+  } catch (e: any) { return err(e); } }
+);
+
+// ── NEW: Safety Check ────────────────────────────────────────
+
+server.tool("rs_check_safety", "Check if it is safe to start simulation (no RAPID errors, controller ready)",
+  {},
+  async () => { try {
+    return ok(await checkSimulationSafety());
+  } catch (e: any) { return err(e); } }
+);
+
 // ═══════════════════════════════════════════════════════════════
 // ██  RWS TOOLS (rws_*) — Robot Controller via Web Services   ██
 // ═══════════════════════════════════════════════════════════════
+
+// ── NEW: Runtime URL Switching ───────────────────────────────
+
+server.tool("rws_set_controller_url", "Switch RWS target controller at runtime (virtual ↔ real, no restart needed)",
+  {
+    url: z.string().describe("New controller URL, e.g. 'http://localhost:80' (virtual) or 'http://192.168.125.1:80' (real)"),
+  },
+  async ({ url }) => { try {
+    const previous = getRwsUrl();
+    setRwsUrl(url);
+    resetRwsSession(); // force fresh auth for new controller
+    const current = getRwsUrl();
+    return ok({ previous, current, message: `Controller URL changed: ${previous} → ${current}` });
+  } catch (e: any) { return err(e); } }
+);
 
 // ── Controller ───────────────────────────────────────────────
 
 server.tool("rws_controller_status", "Get controller state via RWS (opmode, motors, RAPID execution)", {},
   async () => { try {
     const [panel, opmode, exec] = await Promise.all([
-      rws( "/rw/panel/ctrlstate"),
-      rws( "/rw/panel/opmode"),
-      rws( "/rw/rapid/execution"),
+      rws("/rw/panel/ctrlstate"),
+      rws("/rw/panel/opmode"),
+      rws("/rw/rapid/execution"),
     ]);
     return ok({
       controllerState: rwsExtract(panel.body, "ctrlstate"),
@@ -357,18 +403,32 @@ server.tool("rws_controller_status", "Get controller state via RWS (opmode, moto
 server.tool("rws_set_motors", "Turn motors on/off via RWS (real controller command)",
   { state: z.enum(["on", "off"]) },
   async ({ state }) => { try {
-    const r = await rws("POST","/rw/panel/ctrlstate?action=setctrlstate",
+    const r = await rws("POST", "/rw/panel/ctrlstate?action=setctrlstate",
       `ctrl-state=motor${state}`, "application/x-www-form-urlencoded");
     return ok({ result: r.status === 204 ? `Motors ${state}` : r.body });
   } catch (e: any) { return err(e); } }
 );
 
-// ── RAPID Execution ──────────────────────────────────────────
+// ── RAPID Execution (RWS) ────────────────────────────────────
 
-server.tool("rws_start_program", "Start RAPID execution on the controller via RWS",
-  { mode: z.enum(["continue", "reset"]).optional() },
-  async ({ mode }) => { try {
-    const r = await rws("POST","/rw/rapid/execution?action=start",
+// ── rws_start_program (ENHANCED: safety guard) ──
+
+server.tool("rws_start_program", "Start RAPID execution on the controller via RWS. Blocks if errors detected — use force=true to override.",
+  {
+    mode: z.enum(["continue", "reset"]).optional(),
+    force: z.boolean().optional().describe("Skip safety check and force start even with errors (default: false)"),
+  },
+  async ({ mode, force }) => { try {
+    if (!force) {
+      const safety = await checkExecutionSafety();
+      if (!safety.safe) {
+        return err(
+          new Error(`Safety check blocked execution: ${safety.reason}\nHint: Set force=true to override`),
+          "SafetyGuard"
+        );
+      }
+    }
+    const r = await rws("POST", "/rw/rapid/execution?action=start",
       `regain=continue&execmode=${mode || "continue"}&cycle=forever&condition=none&stopatbp=disabled&alltaskbytsp=false`,
       "application/x-www-form-urlencoded");
     return ok({ result: r.status === 204 ? "Program started" : r.body });
@@ -377,7 +437,7 @@ server.tool("rws_start_program", "Start RAPID execution on the controller via RW
 
 server.tool("rws_stop_program", "Stop RAPID execution via RWS", {},
   async () => { try {
-    const r = await rws("POST","/rw/rapid/execution?action=stop",
+    const r = await rws("POST", "/rw/rapid/execution?action=stop",
       "stopmode=stop&usetsp=normal", "application/x-www-form-urlencoded");
     return ok({ result: r.status === 204 ? "Program stopped" : r.body });
   } catch (e: any) { return err(e); } }
@@ -385,14 +445,14 @@ server.tool("rws_stop_program", "Stop RAPID execution via RWS", {},
 
 server.tool("rws_reset_pp", "Reset RAPID program pointer via RWS", {},
   async () => { try {
-    const r = await rws("POST","/rw/rapid/execution?action=resetpp");
+    const r = await rws("POST", "/rw/rapid/execution?action=resetpp");
     return ok({ result: r.status === 204 ? "PP reset" : r.body });
   } catch (e: any) { return err(e); } }
 );
 
 server.tool("rws_execution_state", "Get RAPID execution state via RWS", {},
   async () => { try {
-    const r = await rws( "/rw/rapid/execution");
+    const r = await rws("/rw/rapid/execution");
     return ok({ state: rwsExtract(r.body, "ctrlexecstate"), cycle: rwsExtract(r.body, "cycle") });
   } catch (e: any) { return err(e); } }
 );
@@ -401,7 +461,7 @@ server.tool("rws_execution_state", "Get RAPID execution state via RWS", {},
 
 server.tool("rws_get_tasks", "List RAPID tasks via RWS", {},
   async () => { try {
-    const r = await rws( "/rw/rapid/tasks");
+    const r = await rws("/rw/rapid/tasks");
     const names = rwsExtractAll(r.body, "name");
     const excstates = rwsExtractAll(r.body, "excstate");
     return ok(names.map((n, i) => ({ name: n, executionState: excstates[i] ?? "?" })));
@@ -411,7 +471,7 @@ server.tool("rws_get_tasks", "List RAPID tasks via RWS", {},
 server.tool("rws_get_modules", "List RAPID modules in a task via RWS",
   { task: z.string() },
   async ({ task }) => { try {
-    const r = await rws( `/rw/rapid/tasks/${task}/modules`);
+    const r = await rws(`/rw/rapid/tasks/${task}/modules`);
     const names = rwsExtractAll(r.body, "name");
     const types = rwsExtractAll(r.body, "type");
     return ok(names.map((n, i) => ({ name: n, type: types[i] ?? "?" })));
@@ -421,31 +481,129 @@ server.tool("rws_get_modules", "List RAPID modules in a task via RWS",
 server.tool("rws_read_module", "Read RAPID module text via RWS",
   { task: z.string(), module: z.string() },
   async ({ task, module }) => { try {
-    const r = await rws( `/rw/rapid/tasks/${task}/modules/${module}/text`);
+    const r = await rws(`/rw/rapid/tasks/${task}/modules/${module}/text`);
     const text = rwsExtract(r.body, "module-text") || r.body;
     return ok({ task, module, text });
   } catch (e: any) { return err(e); } }
 );
 
-server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastership)",
-  { task: z.string(), module: z.string(), code: z.string() },
-  async ({ task, module, code }) => { try {
-    await rws("POST","/rw/mastership/rapid?action=request");
+// ── rws_write_module (ENHANCED: RAPID validation) ──
+
+server.tool("rws_write_module", "Write RAPID module text via RWS (auto-mastership). Validates RAPID syntax before upload.",
+  {
+    task: z.string(), module: z.string(), code: z.string(),
+    skipValidation: z.boolean().optional().describe("Skip RAPID syntax validation (default: false)"),
+  },
+  async ({ task, module, code, skipValidation }) => { try {
+    // Validate RAPID syntax first
+    const v = validateOrReject(code, skipValidation);
+    if (!v.valid) return err(new Error(JSON.stringify(v.error, null, 2)), "RAPID Validation");
+
+    await mastershipRequest("rapid");
     try {
       const r = await rws("POST",
         `/rw/rapid/tasks/${task}/modules/${module}/text?action=set`,
         `module-text=${encodeURIComponent(code)}`, "application/x-www-form-urlencoded");
       return ok({ result: r.status === 204 ? `Module ${module} updated` : r.body });
-    } finally { await rws("POST","/rw/mastership/rapid?action=release").catch(() => {}); }
+    } finally { await mastershipRelease("rapid").catch(() => {}); }
   } catch (e: any) { return err(e); } }
 );
 
-// ── RAPID Variables (RWS — live runtime values) ──────────────
+// ── NEW: RWS Load/Unload Module from File ──────────────────
+
+function validateControllerPath(filepath: string): string {
+  // Block path traversal
+  if (filepath.includes("..")) {
+    throw new Error(`Path traversal blocked: ".." not allowed in "${filepath}"`);
+  }
+  // Must start with $HOME, $SYSTEM, or $TEMP followed by alphanumeric/underscore/hyphen path segments
+  // Dot allowed only in filenames (not as segment), slash as separator
+  if (!/^\$(?:HOME|SYSTEM|TEMP)(?:\/[a-zA-Z0-9_\-]+)*\/[a-zA-Z0-9_\-\.]+$/i.test(filepath)) {
+    throw new Error(
+      `Invalid controller path: "${filepath}". Must start with $HOME, $SYSTEM, or $TEMP.`
+    );
+  }
+  return filepath;
+}
+
+server.tool("rws_load_module_from_file", "Load a RAPID module from a file on the controller filesystem via RWS",
+  {
+    task: z.string().describe("Task name, e.g. 'T_ROB1'"),
+    filepath: z.string().describe("Path on controller, e.g. '$HOME/my_module.mod'"),
+    replace: z.boolean().optional().describe("Replace existing module (default: true)"),
+  },
+  async ({ task, filepath, replace }) => { try {
+    const safePath = validateControllerPath(filepath);
+    await mastershipRequest("rapid");
+    try {
+      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=loadmod`, {
+        modulepath: safePath,
+        replace: replace !== false ? "true" : "false",
+      });
+      return ok({ result: r.status === 204 ? `Module loaded from ${safePath}` : r.body });
+    } finally { await mastershipRelease("rapid").catch(() => {}); }
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rws_unload_module", "Unload (delete) a RAPID module from a task via RWS",
+  {
+    task: z.string().describe("Task name, e.g. 'T_ROB1'"),
+    module: z.string().describe("Module name to unload"),
+  },
+  async ({ task, module }) => { try {
+    await mastershipRequest("rapid");
+    try {
+      const r = await rwsPostForm(`/rw/rapid/tasks/${task}?action=unloadmod`, { module });
+      return ok({ result: r.status === 204 ? `Module ${module} unloaded` : r.body });
+    } finally { await mastershipRelease("rapid").catch(() => {}); }
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rws_save_program", "Save entire RAPID program to a directory on the controller via RWS",
+  {
+    task: z.string().describe("Task name, e.g. 'T_ROB1'"),
+    path: z.string().describe("Directory path on controller, e.g. '$HOME/mybackup'"),
+  },
+  async ({ task, path: savePath }) => { try {
+    const safePath = validateControllerPath(savePath + "/program");
+    const r = await rwsPostForm(`/rw/rapid/tasks/${task}/program?action=save`, { path: safePath });
+    return ok({ result: r.status === 204 ? `Program saved to ${safePath}` : r.body });
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rws_load_program", "Load a RAPID program from the controller filesystem via RWS",
+  {
+    task: z.string().describe("Task name, e.g. 'T_ROB1'"),
+    progpath: z.string().describe("Program file path, e.g. '$HOME/myprog.pgf'"),
+    loadmode: z.enum(["add", "replace"]).optional().describe("Load mode (default: replace)"),
+  },
+  async ({ task, progpath, loadmode }) => { try {
+    const safePath = validateControllerPath(progpath);
+    const r = await rwsPostForm(`/rw/rapid/tasks/${task}/program?action=loadprog`, {
+      progpath: safePath,
+      loadmode: loadmode || "replace",
+    });
+    return ok({ result: r.status === 204 ? `Program loaded from ${safePath}` : r.body });
+  } catch (e: any) { return err(e); } }
+);
+
+server.tool("rws_restart_controller", "Restart the robot controller via RWS (warm-start, resets RAPID)",
+  {
+    mode: z.enum(["warm", "cold"]).optional().describe("Restart mode: warm (keep system params) or cold (full restart). Default: warm."),
+  },
+  async ({ mode }) => { try {
+    const restartMode = mode || "warm";
+    const r = await rws("POST", `/rw/panel/ctrlstate?action=${restartMode}start`);
+    return ok({ result: r.status === 204 ? `Controller ${restartMode}-started` : r.body });
+  } catch (e: any) { return err(e); } }
+);
+
+// ── RAPID Variables (RWS) ────────────────────────────────────
 
 server.tool("rws_read_variable", "Read a RAPID variable's live runtime value via RWS",
   { task: z.string(), module: z.string(), variable: z.string() },
   async ({ task, module, variable }) => { try {
-    const r = await rws( `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data`);
+    const r = await rws(`/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data`);
     return ok({ variable, value: rwsExtract(r.body, "value") || r.body });
   } catch (e: any) { return err(e); } }
 );
@@ -453,25 +611,25 @@ server.tool("rws_read_variable", "Read a RAPID variable's live runtime value via
 server.tool("rws_write_variable", "Write a RAPID variable's live value via RWS",
   { task: z.string(), module: z.string(), variable: z.string(), value: z.string() },
   async ({ task, module, variable, value }) => { try {
-    await rws("POST","/rw/mastership/rapid?action=request");
+    await mastershipRequest("rapid");
     try {
       const r = await rws("POST",
         `/rw/rapid/symbol/RAPID/${task}/${module}/${variable}/data?action=set`,
         `value=${encodeURIComponent(value)}`, "application/x-www-form-urlencoded");
       return ok({ result: r.status === 204 ? `${variable} = ${value}` : r.body });
-    } finally { await rws("POST","/rw/mastership/rapid?action=release").catch(() => {}); }
+    } finally { await mastershipRelease("rapid").catch(() => {}); }
   } catch (e: any) { return err(e); } }
 );
 
-// ── Robot Position (RWS — live) ──────────────────────────────
+// ── Robot Position (RWS) ────────────────────────────────────
 
 server.tool("rws_get_position", "Get live robot TCP position via RWS",
   { mechUnit: z.string().optional().describe("Default: ROB_1") },
   async ({ mechUnit }) => { try {
     const mu = mechUnit || "ROB_1";
     const [tcp, jt] = await Promise.all([
-      rws( `/rw/motionsystem/mechunits/${mu}/robtarget`),
-      rws( `/rw/motionsystem/mechunits/${mu}/jointtarget`),
+      rws(`/rw/motionsystem/mechunits/${mu}/robtarget`),
+      rws(`/rw/motionsystem/mechunits/${mu}/jointtarget`),
     ]);
     return ok({
       tcp: { x: rwsExtract(tcp.body, "x"), y: rwsExtract(tcp.body, "y"), z: rwsExtract(tcp.body, "z"),
@@ -484,11 +642,11 @@ server.tool("rws_get_position", "Get live robot TCP position via RWS",
   } catch (e: any) { return err(e); } }
 );
 
-// ── I/O Signals (RWS — live) ────────────────────────────────
+// ── I/O Signals (RWS) ───────────────────────────────────────
 
 server.tool("rws_get_io_signals", "List all I/O signals via RWS", {},
   async () => { try {
-    const r = await rws( "/rw/iosystem/signals");
+    const r = await rws("/rw/iosystem/signals");
     const names = rwsExtractAll(r.body, "name");
     const types = rwsExtractAll(r.body, "type");
     const vals = rwsExtractAll(r.body, "lvalue");
@@ -499,7 +657,7 @@ server.tool("rws_get_io_signals", "List all I/O signals via RWS", {},
 server.tool("rws_read_io", "Read a single I/O signal via RWS",
   { signal: z.string() },
   async ({ signal }) => { try {
-    const r = await rws( `/rw/iosystem/signals/${signal}`);
+    const r = await rws(`/rw/iosystem/signals/${signal}`);
     return ok({ signal, type: rwsExtract(r.body, "type"), value: rwsExtract(r.body, "lvalue") });
   } catch (e: any) { return err(e); } }
 );
@@ -507,7 +665,7 @@ server.tool("rws_read_io", "Read a single I/O signal via RWS",
 server.tool("rws_write_io", "Set an I/O signal value via RWS",
   { signal: z.string(), value: z.number() },
   async ({ signal, value }) => { try {
-    const r = await rws("POST",`/rw/iosystem/signals/${signal}/set-value`,
+    const r = await rws("POST", `/rw/iosystem/signals/${signal}/set-value`,
       `lvalue=${value}`, "application/x-www-form-urlencoded;v=2.0");
     return ok({ result: r.status === 204 ? `${signal} = ${value}` : r.body });
   } catch (e: any) { return err(e); } }
@@ -517,7 +675,7 @@ server.tool("rws_write_io", "Set an I/O signal value via RWS",
 
 server.tool("rws_get_speed_override", "Get speed override percentage via RWS", {},
   async () => { try {
-    const r = await rws( "/rw/panel/speedratio");
+    const r = await rws("/rw/panel/speedratio");
     return ok({ speedRatio: rwsExtract(r.body, "speedratio") });
   } catch (e: any) { return err(e); } }
 );
@@ -525,7 +683,7 @@ server.tool("rws_get_speed_override", "Get speed override percentage via RWS", {
 server.tool("rws_set_speed_override", "Set speed override (0-100%) via RWS",
   { speed: z.number().min(0).max(100) },
   async ({ speed }) => { try {
-    const r = await rws("POST","/rw/panel/speedratio?action=setspeedratio",
+    const r = await rws("POST", "/rw/panel/speedratio?action=setspeedratio",
       `speed-ratio=${speed}`, "application/x-www-form-urlencoded");
     return ok({ result: r.status === 204 ? `Speed ${speed}%` : r.body });
   } catch (e: any) { return err(e); } }
@@ -536,7 +694,7 @@ server.tool("rws_set_speed_override", "Set speed override (0-100%) via RWS",
 server.tool("rws_event_log", "Get controller event log via RWS",
   { count: z.number().optional().describe("Default: 10") },
   async ({ count }) => { try {
-    const r = await rws( `/rw/elog/0?lang=en&count=${count || 10}`);
+    const r = await rws(`/rw/elog/0?lang=en&count=${count || 10}`);
     const titles = rwsExtractAll(r.body, "title");
     const bodies = rwsExtractAll(r.body, "body");
     const timestamps = rwsExtractAll(r.body, "timestamp");
@@ -553,7 +711,7 @@ server.tool("rws_event_log", "Get controller event log via RWS",
 server.tool("rws_list_files", "List files on controller filesystem via RWS",
   { path: z.string().optional().describe("Default: $HOME") },
   async ({ path }) => { try {
-    const r = await rws( `/fileservice/${encodeURIComponent(path || "$HOME")}`);
+    const r = await rws(`/fileservice/${encodeURIComponent(path || "$HOME")}`);
     return ok({ files: r.body });
   } catch (e: any) { return err(e); } }
 );
@@ -561,7 +719,7 @@ server.tool("rws_list_files", "List files on controller filesystem via RWS",
 server.tool("rws_read_file", "Read a file from controller filesystem via RWS",
   { path: z.string() },
   async ({ path }) => { try {
-    const r = await rws( `/fileservice/${encodeURIComponent(path)}`);
+    const r = await rws(`/fileservice/${encodeURIComponent(path)}`);
     return ok({ content: r.body });
   } catch (e: any) { return err(e); } }
 );
@@ -579,7 +737,7 @@ server.tool("rws_write_file", "Write a file to controller filesystem via RWS",
 server.tool("rws_request_mastership", "Request mastership (needed for writes)",
   { domain: z.enum(["rapid", "cfg", "motion"]).optional() },
   async ({ domain }) => { try {
-    const r = await rws("POST",`/rw/mastership/${domain || "rapid"}?action=request`);
+    const r = await rws("POST", `/rw/mastership/${domain || "rapid"}?action=request`);
     return ok({ result: r.status === 204 ? "Mastership acquired" : r.body });
   } catch (e: any) { return err(e); } }
 );
@@ -587,20 +745,24 @@ server.tool("rws_request_mastership", "Request mastership (needed for writes)",
 server.tool("rws_release_mastership", "Release mastership",
   { domain: z.enum(["rapid", "cfg", "motion"]).optional() },
   async ({ domain }) => { try {
-    const r = await rws("POST",`/rw/mastership/${domain || "rapid"}?action=release`);
+    const r = await rws("POST", `/rw/mastership/${domain || "rapid"}?action=release`);
     return ok({ result: r.status === 204 ? "Mastership released" : r.body });
   } catch (e: any) { return err(e); } }
 );
 
-// ── Start Server ─────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════
+// ██  START SERVER                                              ██
+// ═══════════════════════════════════════════════════════════════
 
 async function main() {
   const transport = new StdioServerTransport();
   await server.connect(transport);
-  console.error("ABB RobotStudio MCP Server v2.1.0 (SDK + RWS combined)");
+  console.error("ABB RobotStudio MCP Server v3.0.0 (Safety-First Edition)");
   console.error("  SDK Bridge: " + BRIDGE_URL + " (TcpListener, no admin rights)");
-  console.error("  RWS:        " + RWS_URL);
-  console.error("  Tools:      " + "rs_* (31) + rws_* (24) = 55 total");
+  console.error("  RWS:        " + getRwsUrl() + " (runtime-switchable via rws_set_controller_url)");
+  console.error("  Safety:     RAPID validation + pre-simulation error guard");
+  console.error("  Tools:      rs_* (34) + rws_* (31) = 65 total");
+  console.error("  RULES:      NEVER run simulation if RAPID errors exist");
 }
 
 main().catch((err) => {

@@ -145,6 +145,8 @@ namespace ClaudeBridge
 
             try
             {
+                client.NoDelay = true;
+                client.LingerState = new LingerOption(true, 1);
                 using (client)
                 using (var stream = client.GetStream())
                 {
@@ -303,14 +305,19 @@ namespace ClaudeBridge
                 sb.Append("HTTP/1.1 " + statusCode + " " + statusText + "\r\n");
                 sb.Append("Content-Type: application/json; charset=utf-8\r\n");
 
-                // Dynamic CORS: echo Origin back only if localhost
+                // Dynamic CORS: echo Origin back only if localhost (exact host comparison)
                 if (!string.IsNullOrEmpty(origin))
                 {
-                    var isLocalhost = origin.StartsWith("http://localhost", StringComparison.OrdinalIgnoreCase) ||
-                                      origin.StartsWith("http://127.0.0.1", StringComparison.OrdinalIgnoreCase) ||
-                                      origin.StartsWith("tauri://localhost", StringComparison.OrdinalIgnoreCase) ||
-                                      origin == "https://tauri.localhost" ||
-                                      origin == "https://localhost";
+                    bool isLocalhost = false;
+                    try
+                    {
+                        var originUri = new Uri(origin);
+                        var host = originUri.Host.ToLowerInvariant();
+                        var scheme = originUri.Scheme.ToLowerInvariant();
+                        isLocalhost = (host == "localhost" || host == "127.0.0.1" || host == "[::1]")
+                                      && (scheme == "http" || scheme == "https" || scheme == "tauri");
+                    }
+                    catch (UriFormatException) { /* malformed origin — reject */ }
                     if (isLocalhost)
                     {
                         sb.Append("Access-Control-Allow-Origin: " + origin + "\r\n");
